@@ -1,4 +1,4 @@
-// CS:S v34 probe #2: dumps netvar tables (offsets) and client vtable code bytes -> css_probe2.txt
+// CS:S v34 probe #3: dumps netvar tables (offsets) and client vtable code bytes -> css_probe3.txt
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -43,7 +43,7 @@ static void DumpTable(RecvTable* t, int base, int depth, const char* path) {
 static DWORD WINAPI Run(void*) {
     char path[MAX_PATH]; GetModuleFileNameA(g_self, path, MAX_PATH);
     char* sl = strrchr(path, '\\'); if (sl) *(sl + 1) = 0;
-    strcat_s(path, "css_probe2.txt");
+    strcat_s(path, "css_probe3.txt");
     fopen_s(&g_log, path, "w");
     if (!g_log) return 1;
     Sleep(3000);
@@ -60,7 +60,7 @@ static DWORD WINAPI Run(void*) {
             fprintf(g_log, "\n");
         }
         typedef ClientClass* (__thiscall* GetAllClassesFn)(void*);
-        ClientClass* cc = ((GetAllClassesFn)vt[6])(vc);
+        ClientClass* cc = ((GetAllClassesFn)vt[5])(vc);
         fprintf(g_log, "GetAllClasses -> %p\n", (void*)cc);
         int n = 0;
         for (ClientClass* c = cc; c && n < 600; c = c->m_pNext, ++n)
@@ -72,6 +72,49 @@ static DWORD WINAPI Run(void*) {
             }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         fprintf(g_log, "EXCEPTION during dump\n");
+    }
+
+    // candidate CInput objects referenced by client.dll thunks
+    __try {
+        HMODULE cl = GetModuleHandleA("client.dll");
+        const unsigned long rvas[2] = { 0x3BEA80, 0x39D408 };
+        for (int k = 0; k < 2; ++k) {
+            void** pobj = (void**)((unsigned char*)cl + rvas[k]);
+            void** obj = (void**)*pobj;
+            fprintf(g_log, "INPUTCAND rva=%lX -> obj=%p\n", rvas[k], (void*)obj);
+            if (!obj) continue;
+            void** vt = *(void***)obj;
+            fprintf(g_log, "  vtable=%p\n", (void*)vt);
+            for (int i = 0; i < 70; ++i) {
+                unsigned char* f = (unsigned char*)vt[i];
+                if ((unsigned long)f < (unsigned long)cl || (unsigned long)f > (unsigned long)cl + 0x600000) { fprintf(g_log, "  VT[%d] -> %p (outside client)\n", i, (void*)f); continue; }
+                int retpos = -1;
+                for (int b = 0; b < 0x700; ++b) {
+                    if (f[b] == 0xC2 && f[b + 1] == 0x0C && f[b + 2] == 0x00) { retpos = b; break; }
+                    if (f[b] == 0xC3 && b > 3) { /* simple stop for tiny funcs */ if (b < 16) break; }
+                }
+                fprintf(g_log, "  VT[%d] rva=%08lX ret0C@%d :", i, (unsigned long)(f - (unsigned char*)cl), retpos);
+                for (int b = 0; b < 40; ++b) fprintf(g_log, " %02X", f[b]);
+                fprintf(g_log, "\n");
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        fprintf(g_log, "EXCEPTION during input dump\n");
+    }
+    // entity list vtable
+    __try {
+        HMODULE cl = GetModuleHandleA("client.dll");
+        CreateInterfaceFn ci = (CreateInterfaceFn)GetProcAddress(cl, "CreateInterface");
+        void** el = (void**)ci("VClientEntityList003", nullptr);
+        void** vt = *(void***)el;
+        for (int i = 0; i < 10; ++i) {
+            unsigned char* f = (unsigned char*)vt[i];
+            fprintf(g_log, "ENTLIST[%d] rva=%08lX :", i, (unsigned long)(f - (unsigned char*)cl));
+            for (int b = 0; b < 24; ++b) fprintf(g_log, " %02X", f[b]);
+            fprintf(g_log, "\n");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        fprintf(g_log, "EXCEPTION during entlist dump\n");
     }
     // engine vtable pointers
     __try {
