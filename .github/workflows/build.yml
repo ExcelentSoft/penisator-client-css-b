@@ -1,0 +1,36 @@
+name: Build CSS probe (Win32)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-x86:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure 32-bit MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build DLL and injector
+        shell: cmd
+        run: |
+          cl /nologo /O2 /W3 /MT /LD /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 probe.cpp /link /MACHINE:X86 /OUT:css_probe.dll user32.lib kernel32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /O2 /W3 /MT /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 injector.cpp /link /MACHINE:X86 /OUT:cs16_injector.exe user32.lib kernel32.lib
+          if errorlevel 1 exit /b 1
+
+      - name: Publish binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: css-probe-win32
+          path: |
+            css_probe.dll
+            cs16_injector.exe
+          if-no-files-found: error
