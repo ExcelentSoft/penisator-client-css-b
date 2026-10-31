@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <d3d9.h>
 #include <string.h>
 #include <MinHook.h>
 
@@ -70,8 +72,6 @@ namespace {
     volatile LONG g_status = 0;       // 0 ok, 1 interfaces missing, 2 unsupported client.dll / hook failed
     volatile LONG g_botsOnly = 0;     // 1 = verified: only bots present
     char g_lockWho[48] = "";
-    HWND g_overlay = nullptr;
-    HANDLE g_overlayThread = nullptr;
     LONGLONG g_qpcFreq = 0, g_nextShot = 0;
 
     // ---------------- engine interfaces ----------------
@@ -468,7 +468,7 @@ namespace {
         return pid == GetCurrentProcessId();
     }
 
-    // ============================ overlay + menu ============================
+    // ============================ menu UI ============================
     float g_vx = 0, g_vy = 0;
     bool g_lmbHeld = false;
     volatile LONG g_clickPending = 0;
@@ -516,9 +516,9 @@ namespace {
         HBRUSH k = CreateSolidBrush(kText); FillRect(u.dc, &kn, k); DeleteObject(k);
     }
 
-    void DrawMenu(Ui& u, const RECT& rc) {
+    void DrawMenu(Ui& u) {
         const int W = 380, H = 380;
-        const int x0 = (rc.right - W) / 2, y0 = (rc.bottom - H) / 2;
+        const int x0 = 0, y0 = 0;
         RECT panel = { x0, y0, x0 + W, y0 + H };
         HBRUSH pb = CreateSolidBrush(kBg); FillRect(u.dc, &panel, pb); DeleteObject(pb);
         HBRUSH bd = CreateSolidBrush(kAccent); FrameRect(u.dc, &panel, bd); DeleteObject(bd);
@@ -556,35 +556,206 @@ namespace {
             Checkbox(u, x, y, w, "Enemy ESP (green boxes, through walls)", &g_opt.esp);   y += 30;
             Checkbox(u, x, y, w, "Widescreen FOV (Hor+) - flip if boxes drift", &g_opt.wideFov); y += 34;
             Text(u.dc, x + 6, y, "Draws enemy-team players only.", kDim);                 y += 20;
-            Text(u.dc, x + 6, y, "Use windowed mode so the overlay is visible.", kDim);
+            Text(u.dc, x + 6, y, "Drawn inside the game (fullscreen ok).", kDim);
         }
         Text(u.dc, x0 + 14, y0 + H - 26, "RShift - close menu   |   END - unload", kDim);
     }
 
-    void DrawCursor(HDC dc, int x, int y) {
-        POINT p[3] = { { x, y }, { x, y + 17 }, { x + 12, y + 12 } };
-        HBRUSH b = CreateSolidBrush(RGB(255, 255, 255)); HGDIOBJ ob = SelectObject(dc, b);
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(10, 10, 10)); HGDIOBJ op = SelectObject(dc, pen);
-        Polygon(dc, p, 3);
-        SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(pen);
+    // ============================ in-game rendering (D3D9 Present hook) ============================
+    volatile LONG g_scrW = 1024, g_scrH = 768;
+    volatile LONG g_renderHooked = 0, g_resFreed = 0, g_renderFault = 0;
+    HWND g_inputWnd = nullptr;
+    HANDLE g_inputThread = nullptr;
+
+    void LogMsg(const char* fmt, ...) {
+        char path[MAX_PATH]; if (!GetModuleFileNameA(g_self, path, MAX_PATH)) return;
+        char* s = strrchr(path, '\\'); if (!s) return; strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "css_helper_log.txt");
+        FILE* f = nullptr; if (fopen_s(&f, path, "a") != 0 || !f) return;
+        va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap); fputc('\n', f); fclose(f);
     }
 
-    void PaintOverlay(HWND hwnd) {
-        PAINTSTRUCT ps; HDC wdc = BeginPaint(hwnd, &ps);
-        RECT rc; GetClientRect(hwnd, &rc);
-        HDC dc = CreateCompatibleDC(wdc);
-        HBITMAP bmp = CreateCompatibleBitmap(wdc, rc.right, rc.bottom);
-        HGDIOBJ ob = SelectObject(dc, bmp);
-        HBRUSH black = CreateSolidBrush(RGB(0, 0, 0)); FillRect(dc, &rc, black); DeleteObject(black);
-        SetBkMode(dc, TRANSPARENT);
+    // ---- GDI canvas (DIB) that is uploaded to a texture ----
+    struct Canvas {
+        HDC dc = nullptr; HBITMAP bmp = nullptr; uint32_t* px = nullptr; int w = 0, h = 0;
+        bool Init(int W, int H) {
+            BITMAPINFO bi = {};
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+            bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+            HDC sdc = GetDC(nullptr); dc = CreateCompatibleDC(sdc); ReleaseDC(nullptr, sdc);
+            if (!dc) return false;
+            bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&px, nullptr, 0);
+            if (!bmp || !px) return false;
+            SelectObject(dc, bmp); SetBkMode(dc, TRANSPARENT); w = W; h = H;
+            return true;
+        }
+        void Clear() { GdiFlush(); memset(px, 0, (size_t)w * h * 4); }
+        void Finish() {   // black = transparent, everything else opaque
+            GdiFlush();
+            const size_t n = (size_t)w * h;
+            for (size_t i = 0; i < n; ++i) { const uint32_t c = px[i] & 0x00FFFFFF; px[i] = c ? (c | 0xFF000000u) : 0u; }
+        }
+        void Free() { if (dc) DeleteDC(dc); if (bmp) DeleteObject(bmp); dc = nullptr; bmp = nullptr; px = nullptr; }
+    };
+    struct Tex { IDirect3DTexture9* t = nullptr; };
+
+    void Upload(Tex& t, Canvas& c) {
+        D3DLOCKED_RECT lr;
+        if (!t.t || FAILED(t.t->LockRect(0, &lr, nullptr, 0))) return;
+        for (int y = 0; y < c.h; ++y) memcpy((unsigned char*)lr.pBits + (size_t)y * lr.Pitch, c.px + (size_t)y * c.w, (size_t)c.w * 4);
+        t.t->UnlockRect(0);
+    }
+
+    // ---- vertex batches ----
+    struct VC { float x, y, z, rhw; DWORD c; };
+    struct VT { float x, y, z, rhw, u, v; };
+    VC g_vc[3072]; int g_nvc = 0;
+
+    void Quad(float x, float y, float w, float h, DWORD c) {
+        if (g_nvc + 6 > 3072) return;
+        const float x0 = x - 0.5f, y0 = y - 0.5f, x1 = x + w - 0.5f, y1 = y + h - 0.5f;
+        const VC a = { x0, y0, 0, 1, c }, b = { x1, y0, 0, 1, c }, d = { x1, y1, 0, 1, c }, e = { x0, y1, 0, 1, c };
+        g_vc[g_nvc++] = a; g_vc[g_nvc++] = b; g_vc[g_nvc++] = d;
+        g_vc[g_nvc++] = a; g_vc[g_nvc++] = d; g_vc[g_nvc++] = e;
+    }
+    void Tri(float ax, float ay, float bx, float by, float cx, float cy, DWORD c) {
+        if (g_nvc + 3 > 3072) return;
+        const VC a = { ax - 0.5f, ay - 0.5f, 0, 1, c }, b = { bx - 0.5f, by - 0.5f, 0, 1, c }, d = { cx - 0.5f, cy - 0.5f, 0, 1, c };
+        g_vc[g_nvc++] = a; g_vc[g_nvc++] = b; g_vc[g_nvc++] = d;
+    }
+    void BoxOutline(float x0, float y0, float x1, float y1, float th, DWORD c) {
+        Quad(x0, y0, x1 - x0, th, c); Quad(x0, y1 - th, x1 - x0, th, c);
+        Quad(x0, y0, th, y1 - y0, c); Quad(x1 - th, y0, th, y1 - y0, c);
+    }
+
+    void SetBaseStates(IDirect3DDevice9* d) {
+        d->SetVertexShader(nullptr); d->SetPixelShader(nullptr);
+        d->SetRenderState(D3DRS_ZENABLE, FALSE); d->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA); d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        d->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD); d->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+        d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE); d->SetRenderState(D3DRS_LIGHTING, FALSE);
+        d->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE); d->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        d->SetRenderState(D3DRS_STENCILENABLE, FALSE); d->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        d->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF); d->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        d->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID); d->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+        d->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE); d->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT); d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        d->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        d->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP); d->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        d->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+    }
+    void FlushSolids(IDirect3DDevice9* d) {
+        if (g_nvc >= 3) {
+            d->SetTexture(0, nullptr);
+            d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1); d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+            d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1); d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+            d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+            d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, g_nvc / 3, g_vc, sizeof(VC));
+        }
+        g_nvc = 0;
+    }
+    void DrawTex(IDirect3DDevice9* d, IDirect3DTexture9* t, float x, float y, float w, float h, float u1, float v1) {
+        if (!t) return;
+        d->SetTexture(0, t);
+        d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1); d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1); d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+        const float x0 = x - 0.5f, y0 = y - 0.5f, x1 = x + w - 0.5f, y1 = y + h - 0.5f;
+        const VT v[6] = { { x0, y0, 0, 1, 0, 0 }, { x1, y0, 0, 1, u1, 0 }, { x1, y1, 0, 1, u1, v1 },
+                          { x0, y0, 0, 1, 0, 0 }, { x1, y1, 0, 1, u1, v1 }, { x0, y1, 0, 1, 0, v1 } };
+        d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 2, v, sizeof(VT));
+    }
+
+    // ---- frame state ----
+    IDirect3DDevice9* g_dev = nullptr;
+    Canvas g_menuCv, g_hudCv; Tex g_menuTex, g_hudTex;
+    HFONT g_fMenu = nullptr, g_fHud = nullptr;
+    char g_hudKey[256] = "";
+    const int kMenuTex = 512, kHudW = 512, kHudH = 128, kMenuW = 380, kMenuH = 380, kHudUsedW = 320, kHudUsedH = 96;
+
+    void FreeRes() {
+        if (g_menuTex.t) { g_menuTex.t->Release(); g_menuTex.t = nullptr; }
+        if (g_hudTex.t) { g_hudTex.t->Release(); g_hudTex.t = nullptr; }
+        g_menuCv.Free(); g_hudCv.Free();
+        if (g_fMenu) { DeleteObject(g_fMenu); g_fMenu = nullptr; }
+        if (g_fHud) { DeleteObject(g_fHud); g_fHud = nullptr; }
+        g_hudKey[0] = 0;
+    }
+
+    bool EnsureRes(IDirect3DDevice9* dev) {
+        if (g_menuTex.t && g_hudTex.t) return true;
+        FreeRes();
+        if (!g_menuCv.Init(kMenuTex, kMenuTex) || !g_hudCv.Init(kHudW, kHudH)) { FreeRes(); return false; }
+        if (FAILED(dev->CreateTexture(kMenuTex, kMenuTex, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_menuTex.t, nullptr)) ||
+            FAILED(dev->CreateTexture(kHudW, kHudH, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_hudTex.t, nullptr))) { FreeRes(); return false; }
+        g_fMenu = CreateFontA(16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+        g_fHud = CreateFontA(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
+        return true;
+    }
+
+    void BuildHudStrings(bool locked, bool on, char* l0, char* l1, char* l2, size_t n) {
+        strcpy_s(l0, n, on ? "Trigger - on" : "Trigger - off");
+        l1[0] = 0; l2[0] = 0;
+        const LONG st = InterlockedCompareExchange(&g_status, 0, 0);
+        if (st == 1) strcpy_s(l1, n, "interfaces not found");
+        else if (st == 2) strcpy_s(l1, n, "unsupported client.dll / hook failed");
+        else if (locked) {
+            if (g_lockWho[0] && strcmp(g_lockWho, "not in game") != 0) sprintf_s(l1, n, "online - disabled (%s)", g_lockWho);
+            else strcpy_s(l1, n, g_lockWho[0] ? "waiting: not in game" : "waiting...");
+        }
+        if ((g_enabled || g_opt.aimOn) && !locked) sprintf_s(l2, n, "wpn: %s", g_wpnName);
+    }
+
+    void DrawFrame(IDirect3DDevice9* dev) {
+        if (dev != g_dev) { FreeRes(); g_dev = dev; }
+        IDirect3DSurface9* bb = nullptr;
+        if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+        D3DSURFACE_DESC sd; bb->GetDesc(&sd);
+        const int sw = (int)sd.Width, sh = (int)sd.Height;
+        InterlockedExchange(&g_scrW, sw); InterlockedExchange(&g_scrH, sh);
+        if (!EnsureRes(dev)) { bb->Release(); return; }
 
         const bool locked = !InterlockedCompareExchange(&g_botsOnly, 0, 0);
+        const bool open = InterlockedCompareExchange(&g_menuOpen, 0, 0) != 0;
+        const bool on = InterlockedCompareExchange(&g_enabled, 0, 0) != 0;
+
+        // --- textures (GDI side) ---
+        const int mx = (sw - kMenuW) / 2, my = (sh - kMenuH) / 2;
+        if (open) {
+            if (!g_prevMenuOpen) { g_vx = sw / 2.0f; g_vy = sh / 2.0f; g_clickPending = 0; }
+            g_menuCv.Clear();
+            HGDIOBJ of = SelectObject(g_menuCv.dc, g_fMenu);
+            Ui u = { g_menuCv.dc, InterlockedExchange(&g_clickPending, 0) != 0, g_lmbHeld, (int)g_vx - mx, (int)g_vy - my };
+            DrawMenu(u);
+            SelectObject(g_menuCv.dc, of);
+            g_menuCv.Finish(); Upload(g_menuTex, g_menuCv);
+        }
+        g_prevMenuOpen = open;
+
+        char l0[96], l1[96], l2[96];
+        BuildHudStrings(locked, on, l0, l1, l2, sizeof(l0));
+        char key[256]; sprintf_s(key, "%s|%s|%s", l0, l1, l2);
+        if (strcmp(key, g_hudKey) != 0) {
+            strcpy_s(g_hudKey, key);
+            g_hudCv.Clear();
+            HGDIOBJ of = SelectObject(g_hudCv.dc, g_fHud);
+            RECT r0 = { 0, 2, kHudUsedW - 8, 26 }, r1 = { 0, 28, kHudUsedW - 8, 50 }, r2 = { 0, 50, kHudUsedW - 8, 72 };
+            SetTextColor(g_hudCv.dc, RGB(0, 255, 70));
+            DrawTextA(g_hudCv.dc, l0, -1, &r0, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+            SetTextColor(g_hudCv.dc, RGB(255, 80, 80));
+            if (l1[0]) DrawTextA(g_hudCv.dc, l1, -1, &r1, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+            SetTextColor(g_hudCv.dc, RGB(120, 200, 140));
+            if (l2[0]) DrawTextA(g_hudCv.dc, l2, -1, &r2, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(g_hudCv.dc, of);
+            g_hudCv.Finish(); Upload(g_hudTex, g_hudCv);
+        }
+
+        // --- ESP boxes ---
         if (g_opt.esp && !locked) {
             EspSnap es;
             if (ReadEsp(es) && GetTickCount() - es.t < 200) {
-                HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 255, 70));
-                HGDIOBJ op = SelectObject(dc, pen);
-                HGDIOBJ obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
                 for (int i = 0; i < es.n; ++i) {
                     const float h = es.duck[i] ? 54.0f : 72.0f;
                     float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f; bool ok = true;
@@ -593,66 +764,113 @@ namespace {
                                              es.feet[i][1] + ((c & 2) ? 16.0f : -16.0f),
                                              es.feet[i][2] + ((c & 4) ? h : 0.0f) };
                         float x, y;
-                        if (!WorldToScreen(es, q, (float)rc.right, (float)rc.bottom, x, y)) { ok = false; break; }
+                        if (!WorldToScreen(es, q, (float)sw, (float)sh, x, y)) { ok = false; break; }
                         if (x < minx) minx = x; if (x > maxx) maxx = x;
                         if (y < miny) miny = y; if (y > maxy) maxy = y;
                     }
-                    if (!ok || maxx - minx > rc.right * 2 || maxy - miny > rc.bottom * 2) continue;
-                    Rectangle(dc, (int)minx, (int)miny, (int)maxx, (int)maxy);
+                    if (!ok || maxx - minx > sw * 2 || maxy - miny > sh * 2) continue;
+                    BoxOutline(floorf(minx), floorf(miny), floorf(maxx), floorf(maxy), 2.0f, D3DCOLOR_XRGB(0, 255, 70));
                 }
-                SelectObject(dc, obr); SelectObject(dc, op); DeleteObject(pen);
             }
         }
 
-        const bool open = InterlockedCompareExchange(&g_menuOpen, 0, 0) != 0;
-        const bool on = InterlockedCompareExchange(&g_enabled, 0, 0) != 0;
-        if (open) {
-            HFONT font = CreateFontA(16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-            HGDIOBJ of = SelectObject(dc, font);
-            if (!g_prevMenuOpen) { g_vx = rc.right / 2.0f; g_vy = rc.bottom / 2.0f; g_clickPending = 0; }
-            Ui u = { dc, InterlockedExchange(&g_clickPending, 0) != 0, g_lmbHeld, (int)g_vx, (int)g_vy };
-            DrawMenu(u, rc);
-            DrawCursor(dc, u.cx, u.cy);
-            SelectObject(dc, of); DeleteObject(font);
+        // --- draw ---
+        IDirect3DSurface9* oldRt = nullptr; dev->GetRenderTarget(0, &oldRt);
+        IDirect3DStateBlock9* sb = nullptr;
+        if (SUCCEEDED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) && sb) {
+            if (SUCCEEDED(dev->BeginScene())) {
+                dev->SetRenderTarget(0, bb);
+                D3DVIEWPORT9 vp = { 0, 0, (DWORD)sw, (DWORD)sh, 0.0f, 1.0f }; dev->SetViewport(&vp);
+                SetBaseStates(dev);
+                FlushSolids(dev);                                                    // ESP
+                if (open) DrawTex(dev, g_menuTex.t, (float)mx, (float)my, (float)kMenuW, (float)kMenuH,
+                                  (float)kMenuW / kMenuTex, (float)kMenuH / kMenuTex);
+                DrawTex(dev, g_hudTex.t, (float)(sw - kHudUsedW), 0.0f, (float)kHudUsedW, (float)kHudUsedH,
+                        (float)kHudUsedW / kHudW, (float)kHudUsedH / kHudH);
+                if (open) {                                                           // cursor
+                    const float cx = g_vx, cy = g_vy;
+                    Tri(cx - 1, cy - 1, cx - 1, cy + 20, cx + 15, cy + 14, D3DCOLOR_XRGB(10, 10, 10));
+                    Tri(cx, cy, cx, cy + 17, cx + 12, cy + 12, D3DCOLOR_XRGB(255, 255, 255));
+                    FlushSolids(dev);
+                }
+                dev->EndScene();
+            }
+            sb->Apply(); sb->Release();
         }
-        g_prevMenuOpen = open;
-
-        HFONT hf = CreateFontA(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
-        HGDIOBJ oh = SelectObject(dc, hf);
-        SetTextColor(dc, RGB(0, 255, 70));
-        RECT r1 = { rc.right - 300, 4, rc.right - 8, 28 };
-        DrawTextA(dc, on ? "Trigger - on" : "Trigger - off", -1, &r1, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        const LONG st = InterlockedCompareExchange(&g_status, 0, 0);
-        const char* line = nullptr; char buf[96];
-        if (st == 1) line = "interfaces not found";
-        else if (st == 2) line = "unsupported client.dll / hook failed";
-        else if (locked) {
-            if (g_lockWho[0] && strcmp(g_lockWho, "not in game") != 0) { sprintf_s(buf, "online - disabled (%s)", g_lockWho); line = buf; }
-            else line = g_lockWho[0] ? "waiting: not in game" : "waiting...";
-        }
-        if (line) {
-            SetTextColor(dc, RGB(255, 80, 80));
-            RECT r2 = { rc.right - 300, 28, rc.right - 8, 50 };
-            DrawTextA(dc, line, -1, &r2, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
-        }
-        if ((g_enabled || g_opt.aimOn) && !locked) {
-            char wb[64]; sprintf_s(wb, "wpn: %s", g_wpnName);
-            SetTextColor(dc, RGB(120, 200, 140));
-            RECT r4 = { rc.right - 300, 50, rc.right - 8, 72 };
-            DrawTextA(dc, wb, -1, &r4, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
-        }
-        SelectObject(dc, oh); DeleteObject(hf);
-
-        BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
-        SelectObject(dc, ob); DeleteObject(bmp); DeleteDC(dc);
-        EndPaint(hwnd, &ps);
+        if (oldRt) { dev->SetRenderTarget(0, oldRt); oldRt->Release(); }
+        bb->Release();
+        static bool logged = false;
+        if (!logged) { logged = true; LogMsg("first frame drawn %dx%d", sw, sh); }
     }
 
-    LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    typedef HRESULT(WINAPI* PresentFn)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+    PresentFn g_origPresent = nullptr;
+
+    HRESULT WINAPI HookPresent(IDirect3DDevice9* dev, const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
+        InterlockedIncrement(&g_activeHooks);
+        if (InterlockedCompareExchange(&g_unloading, 0, 0)) {
+            if (!InterlockedCompareExchange(&g_resFreed, 0, 0)) { FreeRes(); InterlockedExchange(&g_resFreed, 1); }
+        } else if (!InterlockedCompareExchange(&g_renderFault, 0, 0)) {
+            __try { DrawFrame(dev); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedExchange(&g_renderFault, 1); }
+        }
+        const HRESULT hr = g_origPresent(dev, a, b, c, d);
+        InterlockedDecrement(&g_activeHooks);
+        return hr;
+    }
+
+    LRESULT CALLBACK DummyProc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcA(h, m, w, l); }
+
+    // creates a throw-away windowed device only to read the Present address of d3d9.dll
+    bool FindPresent(void** out) {
+        HMODULE m = GetModuleHandleA("d3d9.dll");
+        if (!m) { LogMsg("d3d9.dll not loaded"); return false; }
+        typedef IDirect3D9*(WINAPI * CreateFn)(UINT);
+        CreateFn create = (CreateFn)GetProcAddress(m, "Direct3DCreate9");
+        if (!create) return false;
+        IDirect3D9* d3d = create(D3D_SDK_VERSION);
+        if (!d3d) return false;
+        const char* cls = "CSSHelperDummy";
+        WNDCLASSEXA wc = {}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = DummyProc; wc.hInstance = g_self; wc.lpszClassName = cls;
+        RegisterClassExA(&wc);
+        HWND w = CreateWindowExA(0, cls, "", WS_OVERLAPPED, 0, 0, 16, 16, nullptr, nullptr, g_self, nullptr);
+        bool ok = false;
+        if (w) {
+            D3DPRESENT_PARAMETERS pp = {};
+            pp.Windowed = TRUE; pp.SwapEffect = D3DSWAPEFFECT_DISCARD; pp.BackBufferFormat = D3DFMT_UNKNOWN; pp.hDeviceWindow = w;
+            IDirect3DDevice9* dev = nullptr;
+            HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, w,
+                                           D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES, &pp, &dev);
+            if (FAILED(hr)) {
+                LogMsg("CreateDevice HAL failed 0x%08lX, trying NULLREF", (unsigned long)hr);
+                hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, w,
+                                       D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES, &pp, &dev);
+            }
+            if (SUCCEEDED(hr) && dev) { *out = (*(void***)dev)[17]; ok = true; dev->Release(); }
+            else LogMsg("CreateDevice failed 0x%08lX", (unsigned long)hr);
+            DestroyWindow(w);
+        }
+        UnregisterClassA(cls, g_self);
+        d3d->Release();
+        return ok;
+    }
+
+    bool InstallRender() {
+        void* present = nullptr;
+        if (!FindPresent(&present) || !present) return false;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        if (MH_CreateHook(present, (void*)&HookPresent, (void**)&g_origPresent) != MH_OK) { LogMsg("MH_CreateHook(Present) failed"); return false; }
+        if (MH_EnableHook(present) != MH_OK) { LogMsg("MH_EnableHook(Present) failed"); return false; }
+        InterlockedExchange(&g_hooksReady, 1);
+        InterlockedExchange(&g_renderHooked, 1);
+        LogMsg("Present hooked");
+        return true;
+    }
+
+    // ---- raw mouse input for the menu cursor (hidden window, own thread) ----
+    LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (msg) {
-        case WM_TIMER: InvalidateRect(hwnd, nullptr, FALSE); return 0;
         case WM_INPUT: {
             if (!InterlockedCompareExchange(&g_menuOpen, 0, 0)) return 0;
             RAWINPUT ri; UINT sz = sizeof(ri);
@@ -660,64 +878,41 @@ namespace {
             if (ri.header.dwType != RIM_TYPEMOUSE) return 0;
             const RAWMOUSE& m = ri.data.mouse;
             if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE)) { g_vx += (float)m.lLastX; g_vy += (float)m.lLastY; }
-            RECT rc; GetClientRect(hwnd, &rc);
+            const float W = (float)InterlockedCompareExchange(&g_scrW, 0, 0), H = (float)InterlockedCompareExchange(&g_scrH, 0, 0);
             if (g_vx < 0) g_vx = 0; if (g_vy < 0) g_vy = 0;
-            if (g_vx > rc.right - 1) g_vx = (float)(rc.right - 1);
-            if (g_vy > rc.bottom - 1) g_vy = (float)(rc.bottom - 1);
+            if (g_vx > W - 1) g_vx = W - 1; if (g_vy > H - 1) g_vy = H - 1;
             if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) { g_lmbHeld = true; InterlockedExchange(&g_clickPending, 1); }
             if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) g_lmbHeld = false;
             return 0;
         }
-        case WM_NCHITTEST: return HTTRANSPARENT;
-        case WM_ERASEBKGND: return 1;
-        case WM_PAINT: PaintOverlay(hwnd); return 0;
         case WM_CLOSE: DestroyWindow(hwnd); return 0;
-        case WM_DESTROY: KillTimer(hwnd, 1); PostQuitMessage(0); return 0;
+        case WM_DESTROY: PostQuitMessage(0); return 0;
         }
         return DefWindowProcA(hwnd, msg, wp, lp);
     }
 
-    DWORD WINAPI OverlayThread(void*) {
-        const char* cls = "CSSHelperOverlayV1";
-        WNDCLASSEXA wc = {}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = OverlayProc;
-        wc.hInstance = g_self; wc.lpszClassName = cls; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    DWORD WINAPI InputThread(void*) {
+        const char* cls = "CSSHelperInputV2";
+        WNDCLASSEXA wc = {}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = InputProc; wc.hInstance = g_self; wc.lpszClassName = cls;
         if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 1;
-        HWND h = CreateWindowExA(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                                 cls, "status", WS_POPUP, 0, 0, 300, 80, nullptr, nullptr, g_self, nullptr);
+        HWND h = CreateWindowExA(0, cls, "in", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g_self, nullptr);   // never shown
         if (!h) return 1;
-        g_overlay = h;
-        SetLayeredWindowAttributes(h, RGB(0, 0, 0), 0, LWA_COLORKEY);
+        g_inputWnd = h;
         RAWINPUTDEVICE rid = { 0x01, 0x02, RIDEV_INPUTSINK, h };
         RegisterRawInputDevices(&rid, 1, sizeof(rid));
-        SetTimer(h, 1, 10, nullptr);
-        ShowWindow(h, SW_SHOWNOACTIVATE);
         MSG m;
         while (GetMessageA(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageA(&m); }
         RAWINPUTDEVICE off = { 0x01, 0x02, RIDEV_REMOVE, nullptr };
         RegisterRawInputDevices(&off, 1, sizeof(off));
-        g_overlay = nullptr;
+        g_inputWnd = nullptr;
         UnregisterClassA(cls, g_self);
         return 0;
-    }
-
-    void PlaceOverlay(bool fg) {
-        HWND o = g_overlay;
-        if (!o || !IsWindow(o)) return;
-        if (!fg) { ShowWindow(o, SW_HIDE); return; }
-        HWND game = GetForegroundWindow();
-        RECT rc; if (!game || !GetClientRect(game, &rc)) return;
-        POINT pt = { rc.left, rc.top }; ClientToScreen(game, &pt);
-        const int gw = rc.right - rc.left, gh = rc.bottom - rc.top;
-        if (InterlockedCompareExchange(&g_menuOpen, 0, 0) || g_opt.esp)
-            SetWindowPos(o, HWND_TOPMOST, pt.x, pt.y, gw, gh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        else
-            SetWindowPos(o, HWND_TOPMOST, pt.x + gw - 300, pt.y, 300, 80, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
     // ============================ worker ============================
     DWORD WINAPI Worker(void*) {
         LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpcFreq = f.QuadPart;
-        g_overlayThread = CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
+        g_inputThread = CreateThread(nullptr, 0, InputThread, nullptr, 0, nullptr);
 
         bool ok = false;
         for (int i = 0; i < 50 && !ok; ++i) { ok = InitInterfaces(); if (!ok) Sleep(200); }
@@ -726,30 +921,33 @@ namespace {
             if (!InstallHook()) InterlockedExchange(&g_status, 2);
             else InterlockedExchange(&g_ifaceReady, 1);
         }
+        bool renderOk = false; DWORD lastTry = 0; int tries = 0;
 
-        bool prevToggle = false, prevEnd = false; DWORD lastOv = 0;
+        bool prevToggle = false, prevEnd = false;
         while (!InterlockedCompareExchange(&g_unloading, 0, 0)) {
             const DWORD now = GetTickCount();
+            if (!renderOk && tries < 60 && now - lastTry >= 1000) {
+                lastTry = now; ++tries;
+                renderOk = InstallRender();
+            }
             const bool fg = GameForeground();
             const bool tog = fg && (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-            if (tog && !prevToggle) {
-                InterlockedExchange(&g_menuOpen, InterlockedCompareExchange(&g_menuOpen, 0, 0) ? 0 : 1);
-                PlaceOverlay(fg);
-            }
+            if (tog && !prevToggle) InterlockedExchange(&g_menuOpen, InterlockedCompareExchange(&g_menuOpen, 0, 0) ? 0 : 1);
             prevToggle = tog;
             const bool end = fg && (GetAsyncKeyState(VK_END) & 0x8000);
             if (end && !prevEnd) { InterlockedExchange(&g_unloading, 1); break; }
             prevEnd = end;
-            if (now - lastOv >= 100) { PlaceOverlay(fg); lastOv = now; }
             Sleep(5);
         }
 
         InterlockedExchange(&g_enabled, 0);
         InterlockedExchange(&g_menuOpen, 0);
         InterlockedExchange(&g_ifaceReady, 0);
+        if (InterlockedCompareExchange(&g_renderHooked, 0, 0))                    // let the render thread free its textures
+            for (int i = 0; i < 300 && !InterlockedCompareExchange(&g_resFreed, 0, 0); ++i) Sleep(5);
         UninstallHook();
-        if (g_overlay) PostMessageA(g_overlay, WM_CLOSE, 0, 0);
-        if (g_overlayThread) { WaitForSingleObject(g_overlayThread, 1500); CloseHandle(g_overlayThread); }
+        if (g_inputWnd) PostMessageA(g_inputWnd, WM_CLOSE, 0, 0);
+        if (g_inputThread) { WaitForSingleObject(g_inputThread, 1500); CloseHandle(g_inputThread); }
         FreeLibraryAndExitThread(g_self, 0);
         return 0;
     }
