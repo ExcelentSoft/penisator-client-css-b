@@ -1,136 +1,103 @@
-// CS:S v34 probe #3: dumps netvar tables (offsets) and client vtable code bytes -> css_probe3.txt
+// CS:S v34 probe #4: self-test of layouts + TraceRay vtable scan -> css_probe4.txt
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
+#include <stdint.h>
 
 static HMODULE g_self;
 static FILE* g_log;
 typedef void* (__cdecl* CreateInterfaceFn)(const char*, int*);
 
-struct RecvTable;
-struct RecvProp {
-    const char* m_pVarName; int m_RecvType; int m_Flags; int m_StringBufferSize; bool m_bInsideArray;
-    const void* m_pExtraData; RecvProp* m_pArrayProp; void* m_ArrayLengthProxy; void* m_ProxyFn;
-    void* m_DataTableProxyFn; RecvTable* m_pDataTable; int m_Offset; int m_ElementStride; int m_nElements;
-    const char* m_pParentArrayPropName;
-};
-struct RecvTable { RecvProp* m_pProps; int m_nProps; void* m_pDecoder; const char* m_pNetTableName; bool m_bInitialized; bool m_bInMainList; };
-struct ClientClass { void* m_pCreateFn; void* m_pCreateEventFn; const char* m_pNetworkName; RecvTable* m_pRecvTable; ClientClass* m_pNext; int m_ClassID; };
+// netvar offsets found by probe #3
+enum { OFF_TEAM = 144, OFF_LIFE = 135, OFF_HEALTH = 3492, OFF_ORIGIN = 668, OFF_FLAGS = 692,
+       OFF_VIEWOFS = 212, OFF_VEL = 224, OFF_PUNCH = 2992, OFF_FOV = 3356, OFF_ACTWEAPON = 2872 };
 
-static bool Wanted(const char* n) {
-    static const char* w[] = { "CCSPlayer", "CBasePlayer", "CBaseEntity", "CBaseCombatCharacter", "CBaseAnimating",
-                               "CBaseCombatWeapon", "CWeaponCSBase", "CCSPlayerResource", "CPlayerResource",
-                               "CCSTeam", "CTeam", "CAK47", "CWeaponAWP" };
-    for (auto s : w) if (strcmp(n, s) == 0) return true;
-    return false;
-}
+template <class T> static T Rd(void* base, int off) { return *(T*)((unsigned char*)base + off); }
 
-static void DumpTable(RecvTable* t, int base, int depth, const char* path) {
-    if (!t || depth > 5) return;
-    for (int i = 0; i < t->m_nProps; ++i) {
-        RecvProp* p = &t->m_pProps[i];
-        if (!p->m_pVarName) continue;
-        if (p->m_pDataTable) {
-            char np[160]; sprintf_s(np, "%s.%s", path, p->m_pVarName);
-            DumpTable(p->m_pDataTable, base + p->m_Offset, depth + 1, np);
-        } else {
-            fprintf(g_log, "   %s.%s type=%d off=%d (abs %d)\n", path, p->m_pVarName, p->m_RecvType, p->m_Offset, base + p->m_Offset);
-        }
-    }
-}
+struct __declspec(align(16)) VecA { float x, y, z, w; };
+struct __declspec(align(16)) Ray_t { VecA start, delta, startOffset, extents; bool isRay; bool isSwept; };
+
+static void* g_localEnt = nullptr;
+static bool __fastcall F_ShouldHit(void*, void*, void* ent, int) { return ent != g_localEnt; }
+static int  __fastcall F_TraceType(void*, void*) { return 0; }
+static void* g_filterVtbl[2] = { (void*)&F_ShouldHit, (void*)&F_TraceType };
+struct Filter { void** vtbl; };
+
+typedef void (__thiscall* TraceRayFn)(void*, const Ray_t&, unsigned, void*, void*);
 
 static DWORD WINAPI Run(void*) {
     char path[MAX_PATH]; GetModuleFileNameA(g_self, path, MAX_PATH);
     char* sl = strrchr(path, '\\'); if (sl) *(sl + 1) = 0;
-    strcat_s(path, "css_probe3.txt");
+    strcat_s(path, "css_probe4.txt");
     fopen_s(&g_log, path, "w");
     if (!g_log) return 1;
     Sleep(3000);
-    __try {
-        HMODULE cl = GetModuleHandleA("client.dll");
-        CreateInterfaceFn ci = (CreateInterfaceFn)GetProcAddress(cl, "CreateInterface");
-        void** vc = (void**)ci("VClient013", nullptr);
-        fprintf(g_log, "VClient013=%p client.dll base=%p\n", (void*)vc, (void*)cl);
-        void** vt = *(void***)vc;
-        for (int i = 0; i < 45; ++i) {
-            unsigned char* f = (unsigned char*)vt[i];
-            fprintf(g_log, "VCLIENT[%d] rva=%08lX :", i, (unsigned long)((unsigned char*)f - (unsigned char*)cl));
-            for (int b = 0; b < 24; ++b) fprintf(g_log, " %02X", f[b]);
-            fprintf(g_log, "\n");
-        }
-        typedef ClientClass* (__thiscall* GetAllClassesFn)(void*);
-        ClientClass* cc = ((GetAllClassesFn)vt[5])(vc);
-        fprintf(g_log, "GetAllClasses -> %p\n", (void*)cc);
-        int n = 0;
-        for (ClientClass* c = cc; c && n < 600; c = c->m_pNext, ++n)
-            fprintf(g_log, "CLASS %d id=%d %s table=%s\n", n, c->m_ClassID, c->m_pNetworkName, c->m_pRecvTable ? c->m_pRecvTable->m_pNetTableName : "?");
-        for (ClientClass* c = cc; c; c = c->m_pNext)
-            if (Wanted(c->m_pNetworkName)) {
-                fprintf(g_log, "=== %s ===\n", c->m_pNetworkName);
-                DumpTable(c->m_pRecvTable, 0, 0, c->m_pRecvTable->m_pNetTableName);
-            }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        fprintf(g_log, "EXCEPTION during dump\n");
-    }
+    HMODULE cl = GetModuleHandleA("client.dll"), en = GetModuleHandleA("engine.dll");
+    CreateInterfaceFn ciC = (CreateInterfaceFn)GetProcAddress(cl, "CreateInterface");
+    CreateInterfaceFn ciE = (CreateInterfaceFn)GetProcAddress(en, "CreateInterface");
+    void** engine = (void**)ciE("VEngineClient012", nullptr);
+    void** entlist = (void**)ciC("VClientEntityList003", nullptr);
+    void** trace = (void**)ciE("EngineTraceClient003", nullptr);
+    void** evt = *(void***)engine; void** lvt = *(void***)entlist;
+    fprintf(g_log, "client.dll size check: see probe1 (4689920)\n");
 
-    // candidate CInput objects referenced by client.dll thunks
     __try {
-        HMODULE cl = GetModuleHandleA("client.dll");
-        const unsigned long rvas[2] = { 0x3BEA80, 0x39D408 };
-        for (int k = 0; k < 2; ++k) {
-            void** pobj = (void**)((unsigned char*)cl + rvas[k]);
-            void** obj = (void**)*pobj;
-            fprintf(g_log, "INPUTCAND rva=%lX -> obj=%p\n", rvas[k], (void*)obj);
-            if (!obj) continue;
-            void** vt = *(void***)obj;
-            fprintf(g_log, "  vtable=%p\n", (void*)vt);
-            for (int i = 0; i < 70; ++i) {
-                unsigned char* f = (unsigned char*)vt[i];
-                if ((unsigned long)f < (unsigned long)cl || (unsigned long)f > (unsigned long)cl + 0x600000) { fprintf(g_log, "  VT[%d] -> %p (outside client)\n", i, (void*)f); continue; }
-                int retpos = -1;
-                for (int b = 0; b < 0x700; ++b) {
-                    if (f[b] == 0xC2 && f[b + 1] == 0x0C && f[b + 2] == 0x00) { retpos = b; break; }
-                    if (f[b] == 0xC3 && b > 3) { /* simple stop for tiny funcs */ if (b < 16) break; }
-                }
-                fprintf(g_log, "  VT[%d] rva=%08lX ret0C@%d :", i, (unsigned long)(f - (unsigned char*)cl), retpos);
-                for (int b = 0; b < 40; ++b) fprintf(g_log, " %02X", f[b]);
-                fprintf(g_log, "\n");
+        typedef int (__thiscall* IntFn)(void*);
+        typedef bool (__thiscall* BoolFn)(void*);
+        typedef void (__thiscall* VecFn)(void*, float*);
+        typedef void* (__thiscall* EntFn)(void*, int);
+        typedef bool (__thiscall* PInfoFn)(void*, int, void*);
+        int local = ((IntFn)evt[12])(engine);
+        int maxc = ((IntFn)evt[21])(engine);
+        bool ingame = ((BoolFn)evt[26])(engine);
+        float va[3]; ((VecFn)evt[19])(engine, va);
+        fprintf(g_log, "IsInGame=%d localIdx=%d maxClients=%d viewangles=(%.2f %.2f %.2f)\n", ingame, local, maxc, va[0], va[1], va[2]);
+        int highest = ((IntFn)lvt[6])(entlist);
+        fprintf(g_log, "HighestEntityIndex=%d\n", highest);
+        EntFn getEnt = (EntFn)lvt[3];
+        for (int i = 1; i <= maxc && i <= 64; ++i) {
+            void* e = getEnt(entlist, i);
+            if (!e) continue;
+            char pi[400]; memset(pi, 0, sizeof(pi));
+            bool okp = ((PInfoFn)evt[8])(engine, i, pi);
+            fprintf(g_log, "ENT %d ptr=%p name='%.32s' (pinfo=%d) team=%d life=%d hp=%d flags=%08X origin=(%.1f %.1f %.1f) viewofs=(%.1f %.1f %.1f) vel=(%.1f %.1f %.1f) fov=%d%s\n",
+                    i, e, pi, okp, Rd<int>(e, OFF_TEAM), (int)Rd<unsigned char>(e, OFF_LIFE), Rd<int>(e, OFF_HEALTH), Rd<int>(e, OFF_FLAGS),
+                    Rd<float>(e, OFF_ORIGIN), Rd<float>(e, OFF_ORIGIN + 4), Rd<float>(e, OFF_ORIGIN + 8),
+                    Rd<float>(e, OFF_VIEWOFS), Rd<float>(e, OFF_VIEWOFS + 4), Rd<float>(e, OFF_VIEWOFS + 8),
+                    Rd<float>(e, OFF_VEL), Rd<float>(e, OFF_VEL + 4), Rd<float>(e, OFF_VEL + 8), Rd<int>(e, OFF_FOV),
+                    i == local ? "  <-- LOCAL" : "");
+            if (i == local) fprintf(g_log, "      punch=(%.2f %.2f %.2f)\n", Rd<float>(e, OFF_PUNCH), Rd<float>(e, OFF_PUNCH + 4), Rd<float>(e, OFF_PUNCH + 8));
+        }
+        void* me = getEnt(entlist, local);
+        g_localEnt = me;
+        if (me) {
+            float eye[3] = { Rd<float>(me, OFF_ORIGIN) + Rd<float>(me, OFF_VIEWOFS), Rd<float>(me, OFF_ORIGIN + 4) + Rd<float>(me, OFF_VIEWOFS + 4),
+                             Rd<float>(me, OFF_ORIGIN + 8) + Rd<float>(me, OFF_VIEWOFS + 8) };
+            const float d2r = 3.14159265f / 180.0f;
+            float fwd[3] = { cosf(va[0] * d2r) * cosf(va[1] * d2r), cosf(va[0] * d2r) * sinf(va[1] * d2r), -sinf(va[0] * d2r) };
+            fprintf(g_log, "EYE=(%.1f %.1f %.1f) fwd=(%.3f %.3f %.3f)\n", eye[0], eye[1], eye[2], fwd[0], fwd[1], fwd[2]);
+            Ray_t ray; memset(&ray, 0, sizeof(ray));
+            ray.start.x = eye[0]; ray.start.y = eye[1]; ray.start.z = eye[2];
+            ray.delta.x = fwd[0] * 8192; ray.delta.y = fwd[1] * 8192; ray.delta.z = fwd[2] * 8192;
+            ray.isRay = true; ray.isSwept = true;
+            Filter filt = { g_filterVtbl };
+            void** tvt = *(void***)trace;
+            fprintf(g_log, "TRACE iface=%p vtbl=%p sizeof(Ray_t)=%d\n", (void*)trace, (void*)tvt, (int)sizeof(Ray_t));
+            for (int idx = 0; idx < 8; ++idx) {
+                __declspec(align(16)) unsigned int buf[64];
+                for (int k = 0; k < 64; ++k) buf[k] = 0xCDCDCDCD;
+                bool crashed = false;
+                __try { ((TraceRayFn)tvt[idx])(trace, ray, 0x4600400B, &filt, buf); } __except (EXCEPTION_EXECUTE_HANDLER) { crashed = true; }
+                fprintf(g_log, "  TRY vt[%d]%s:", idx, crashed ? " (exception)" : "");
+                for (int k = 0; k < 24; ++k) fprintf(g_log, " %08X", buf[k]);
+                float fr = *(float*)&buf[11];
+                fprintf(g_log, "  | fraction@11=%.4f endpos=(%.1f %.1f %.1f)\n", fr, *(float*)&buf[3], *(float*)&buf[4], *(float*)&buf[5]);
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        fprintf(g_log, "EXCEPTION during input dump\n");
-    }
-    // entity list vtable
-    __try {
-        HMODULE cl = GetModuleHandleA("client.dll");
-        CreateInterfaceFn ci = (CreateInterfaceFn)GetProcAddress(cl, "CreateInterface");
-        void** el = (void**)ci("VClientEntityList003", nullptr);
-        void** vt = *(void***)el;
-        for (int i = 0; i < 10; ++i) {
-            unsigned char* f = (unsigned char*)vt[i];
-            fprintf(g_log, "ENTLIST[%d] rva=%08lX :", i, (unsigned long)(f - (unsigned char*)cl));
-            for (int b = 0; b < 24; ++b) fprintf(g_log, " %02X", f[b]);
-            fprintf(g_log, "\n");
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        fprintf(g_log, "EXCEPTION during entlist dump\n");
-    }
-    // engine vtable pointers
-    __try {
-        HMODULE en = GetModuleHandleA("engine.dll");
-        CreateInterfaceFn ci = (CreateInterfaceFn)GetProcAddress(en, "CreateInterface");
-        void** ve = (void**)ci("VEngineClient012", nullptr);
-        void** vt = *(void***)ve;
-        fprintf(g_log, "VEngineClient012=%p\n", (void*)ve);
-        for (int i = 0; i < 90; ++i) {
-            unsigned char* f = (unsigned char*)vt[i];
-            fprintf(g_log, "VENGINE[%d] rva=%08lX :", i, (unsigned long)((unsigned char*)f - (unsigned char*)en));
-            for (int b = 0; b < 12; ++b) fprintf(g_log, " %02X", f[b]);
-            fprintf(g_log, "\n");
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        fprintf(g_log, "EXCEPTION during engine dump\n");
+        fprintf(g_log, "EXCEPTION in self-test\n");
     }
     fprintf(g_log, "DONE\n");
     fclose(g_log);
