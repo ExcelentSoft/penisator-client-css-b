@@ -29,7 +29,7 @@ namespace {
                   OFF_VIEWOFS = 212, OFF_VEL = 224, OFF_PUNCH = 2992, OFF_FOV = 3356, OFF_DEFFOV = 3368,
                   OFF_ACTWEAPON = 2872, OFF_SIMTIME = 104;
     constexpr int FL_ONGROUND = 1 << 0, FL_DUCKING = 1 << 1;
-    constexpr int IN_ATTACK = 1;
+    constexpr int IN_ATTACK = 1, IN_ATTACK2 = 1 << 11;
     constexpr int kPlayerInfoFakeOffset = 108;                    // player_info_t::fakeplayer
 
     // IVEngineClient012 vtable indices
@@ -52,8 +52,8 @@ namespace {
     // ---------------- options ----------------
     struct Opts {
         volatile LONG teamCheck = 1;
-        volatile LONG ground = 1;
-        volatile LONG speedCheck = 1;
+        volatile LONG ground = 0;
+        volatile LONG speedCheck = 0;
         volatile LONG scopeCheck = 1;
         volatile LONG intervalPct = 100;
         volatile LONG esp = 0;
@@ -61,7 +61,6 @@ namespace {
         volatile LONG aimOn = 0;
         volatile LONG aimHead = 1;
         volatile LONG aimFov = 10;
-        volatile LONG headLead = 70;   // ms of target movement to lead when aiming at the head
     } g_opt;
 
     HMODULE g_self = nullptr;
@@ -73,7 +72,7 @@ namespace {
     volatile LONG g_status = 0;       // 0 ok, 1 interfaces missing, 2 unsupported client.dll / hook failed
     volatile LONG g_botsOnly = 0;     // 1 = verified: only bots present
     char g_lockWho[48] = "";
-    LONGLONG g_qpcFreq = 0, g_nextShot = 0;
+    LONGLONG g_qpcFreq = 0, g_nextShot = 0, g_nextScope = 0;
 
     // ---------------- engine interfaces ----------------
     typedef void* (__cdecl* CreateInterfaceFn)(const char*, int*);
@@ -245,7 +244,7 @@ namespace {
     }
 
     // ---------------- per-frame logic (runs inside CInput::CreateMove, game thread) ----------------
-    struct Target { int idx; float feet[3]; bool duck; float vel[3]; };
+    struct Target { int idx; void* ent; float feet[3]; bool duck; };
 
     void CheckBotsOnly(int local, int maxc, bool ingame) {
         bool humans = false; char who[48] = "";
@@ -258,6 +257,35 @@ namespace {
         }
         if (humans) { strcpy_s(g_lockWho, who); InterlockedExchange(&g_botsOnly, 0); }
         else { g_lockWho[0] = 0; InterlockedExchange(&g_botsOnly, 1); }
+    }
+
+    // Finds the real head position: casts rays at the target's hitboxes (client pose) and averages the points
+    // where the engine reports hitgroup == HEAD. Returns false if no head hit was found.
+    typedef void (__thiscall* ClipFn)(void*, const Ray&, unsigned int, void*, void*);
+    bool HeadPoint(void* ent, const float* eye, const float* guess, float* out) {
+        float sum[3] = { 0, 0, 0 }; int n = 0;
+        for (int iz = -2; iz <= 2; ++iz) for (int ix = -1; ix <= 1; ++ix) for (int iy = -1; iy <= 1; ++iy) {
+            const float pt[3] = { guess[0] + ix * 5.0f, guess[1] + iy * 5.0f, guess[2] + iz * 3.5f };
+            Ray r; memset(&r, 0, sizeof(r));
+            for (int i = 0; i < 3; ++i) { r.start[i] = eye[i]; r.delta[i] = (pt[i] - eye[i]) * 1.5f; }
+            r.isRay = true; r.isSwept = true;
+            __declspec(align(16)) unsigned int buf[64]; memset(buf, 0, sizeof(buf));
+            ((ClipFn)TVT()[2])(g_trace, r, 0x4600400B, ent, buf);
+            const float fraction = *(float*)&buf[11];
+            const int hitgroup = (int)buf[17];
+            if (fraction < 1.0f && hitgroup == 1) {
+                const float* ep = (const float*)&buf[3];
+                if (ep[0] != ep[0]) continue;
+                sum[0] += ep[0]; sum[1] += ep[1]; sum[2] += ep[2]; ++n;
+            }
+        }
+        if (!n) return false;
+        float c[3] = { sum[0] / n, sum[1] / n, sum[2] / n };
+        float dv[3] = { c[0] - eye[0], c[1] - eye[1], c[2] - eye[2] };
+        const float len = sqrtf(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
+        if (len < 1.0f) return false;
+        for (int i = 0; i < 3; ++i) out[i] = c[i] + dv[i] / len * 3.0f;    // a bit inside the head
+        return true;
     }
 
     void OnCreateMove(UserCmd* cmd) {
@@ -297,9 +325,6 @@ namespace {
         Target targets[32]; int nt = 0;
         g_playerPtrCount = 0;
         static DWORD lastSim[65]; static DWORD lastSimChange[65];
-        // own velocity estimate per player (client does not get other players' velocity)
-        static float vPos[65][3], vVel[65][3]; static LONGLONG vT[65];
-        const LONGLONG qNow = Now();
         const DWORD nowMs = GetTickCount();
         for (int i = 1; i <= maxc && i <= 32; ++i) {
             void* e = GetEnt(i);
@@ -314,25 +339,9 @@ namespace {
             const int team = Rd<int>(e, OFF_TEAM);
             if (g_opt.teamCheck && (team == myTeam || (team != 2 && team != 3))) continue;
             Target& t = targets[nt++];
-            t.idx = i;
+            t.idx = i; t.ent = e;
             t.feet[0] = Rd<float>(e, OFF_ORIGIN); t.feet[1] = Rd<float>(e, OFF_ORIGIN + 4); t.feet[2] = Rd<float>(e, OFF_ORIGIN + 8);
             t.duck = (Rd<int>(e, OFF_FLAGS) & FL_DUCKING) != 0;
-            {
-                const float dtS = vT[i] ? (float)(qNow - vT[i]) / (float)g_qpcFreq : 999.0f;
-                const bool moved = fabsf(t.feet[0] - vPos[i][0]) + fabsf(t.feet[1] - vPos[i][1]) + fabsf(t.feet[2] - vPos[i][2]) > 0.01f;
-                if (dtS > 0.3f) { for (int c = 0; c < 3; ++c) vVel[i][c] = 0.0f; for (int c = 0; c < 3; ++c) vPos[i][c] = t.feet[c]; vT[i] = qNow; }
-                else if (moved) {
-                    if (dtS > 0.004f) {
-                        for (int c = 0; c < 3; ++c) vVel[i][c] = 0.5f * vVel[i][c] + 0.5f * (t.feet[c] - vPos[i][c]) / dtS;
-                        for (int c = 0; c < 3; ++c) vPos[i][c] = t.feet[c];
-                        vT[i] = qNow;
-                    }
-                } else if (dtS > 0.15f) { for (int c = 0; c < 3; ++c) vVel[i][c] = 0.0f; }
-                for (int c = 0; c < 3; ++c) t.vel[c] = vVel[i][c];
-                float sp = sqrtf(t.vel[0] * t.vel[0] + t.vel[1] * t.vel[1]);
-                if (sp > 400.0f) { t.vel[0] = t.vel[1] = 0.0f; }   // teleport / respawn glitch
-                t.vel[2] = 0.0f;
-            }
         }
 
         // view direction (this command) incl. recoil punch
@@ -383,8 +392,9 @@ namespace {
                 if (best < 0) break;
                 const float hitp[3] = { eye[0] + fwd[0] * bestT, eye[1] + fwd[1] * bestT, eye[2] + fwd[2] * bestT };
                 if (!ClearLine(eye, hitp)) break;
-                if (g_opt.scopeCheck && wc == W_SNIPER) {
-                    if (!scoped && (bestT > 128.0f || speed > 5.0f)) break;
+                if (g_opt.scopeCheck && wc == W_SNIPER && !scoped) {      // auto-scope, then shoot on a later frame
+                    if (now > g_nextScope) { cmd->buttons |= IN_ATTACK2; g_nextScope = now + g_qpcFreq; }
+                    break;
                 }
                 cmd->buttons |= IN_ATTACK;
                 g_nextShot = now + (LONGLONG)(interval * (float)g_opt.intervalPct * 0.01f * (float)g_qpcFreq);
@@ -392,39 +402,49 @@ namespace {
         }
 
         // ---- FOV aim assist (silent): only while firing
-        if (g_opt.aimOn && (cmd->buttons & IN_ATTACK) && nt > 0) {
+        if (g_opt.aimOn && (cmd->buttons & IN_ATTACK)) {
             float bestAng = (float)g_opt.aimFov; float bp[3]; bool found = false;
+            auto angTo = [&](const float* pt) -> float {
+                const float dv[3] = { pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2] };
+                const float len = sqrtf(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
+                if (len < 1.0f) return 999.0f;
+                float dot = (dv[0] * fwd[0] + dv[1] * fwd[1] + dv[2] * fwd[2]) / len;
+                if (dot > 1.0f) dot = 1.0f; if (dot < -1.0f) dot = -1.0f;
+                return acosf(dot) * 180.0f / kPi;
+            };
             for (int k = 0; k < nt; ++k) {
                 const bool d = targets[k].duck;
-                const float headZ = d ? 48.0f : 66.0f, chestZ = d ? 32.0f : 46.0f;
-                const float lead = g_opt.aimHead ? (float)g_opt.headLead * 0.001f : 0.0f;
-                const float zs[2] = { g_opt.aimHead ? headZ : chestZ, g_opt.aimHead ? chestZ : headZ };
+                const float gh[3] = { targets[k].feet[0], targets[k].feet[1], targets[k].feet[2] + (d ? 48.0f : 66.0f) };
+                const float gc[3] = { targets[k].feet[0], targets[k].feet[1], targets[k].feet[2] + (d ? 32.0f : 46.0f) };
                 for (int j = 0; j < 2; ++j) {
-                    const float ld = (j == 0 && g_opt.aimHead) ? lead : 0.0f;
-                    const float pt[3] = { targets[k].feet[0] + targets[k].vel[0] * ld, targets[k].feet[1] + targets[k].vel[1] * ld, targets[k].feet[2] + zs[j] };
-                    float dv[3] = { pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2] };
-                    const float len = sqrtf(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
-                    if (len < 1.0f) continue;
-                    float dot = (dv[0] * fwd[0] + dv[1] * fwd[1] + dv[2] * fwd[2]) / len;
-                    if (dot > 1.0f) dot = 1.0f; if (dot < -1.0f) dot = -1.0f;
-                    const float ang = acosf(dot) * 180.0f / kPi;
-                    if (ang >= bestAng) break;
+                    const bool wantHead = ((j == 0) == (g_opt.aimHead != 0));
+                    float pt[3];
+                    if (wantHead) {
+                        pt[0] = gh[0]; pt[1] = gh[1]; pt[2] = gh[2];
+                        float hp[3];
+                        if (angTo(gh) < bestAng + 10.0f && HeadPoint(targets[k].ent, eye, gh, hp)) { pt[0] = hp[0]; pt[1] = hp[1]; pt[2] = hp[2]; }
+                    } else { pt[0] = gc[0]; pt[1] = gc[1]; pt[2] = gc[2]; }
+                    const float ang = angTo(pt);
+                    if (ang >= bestAng) continue;
                     if (!ClearLine(eye, pt)) continue;
                     bestAng = ang; bp[0] = pt[0]; bp[1] = pt[1]; bp[2] = pt[2]; found = true; break;
                 }
             }
+            float pitch, yaw;
             if (found) {
                 const float dx = bp[0] - eye[0], dy = bp[1] - eye[1], dz = bp[2] - eye[2];
-                float pitch = -atan2f(dz, sqrtf(dx * dx + dy * dy)) * 180.0f / kPi - punch[0];
-                float yaw = atan2f(dy, dx) * 180.0f / kPi - punch[1];
-                while (yaw > 180.0f) yaw -= 360.0f; while (yaw < -180.0f) yaw += 360.0f;
-                if (pitch > 89.0f) pitch = 89.0f; if (pitch < -89.0f) pitch = -89.0f;
-                const float dd = (yaw - cmd->viewangles[1]) * kPi / 180.0f;
-                const float f = cmd->forwardmove, sd = cmd->sidemove;
-                cmd->forwardmove = f * cosf(dd) - sd * sinf(dd);
-                cmd->sidemove = f * sinf(dd) + sd * cosf(dd);
-                cmd->viewangles[0] = pitch; cmd->viewangles[1] = yaw;
+                pitch = -atan2f(dz, sqrtf(dx * dx + dy * dy)) * 180.0f / kPi - punch[0];
+                yaw = atan2f(dy, dx) * 180.0f / kPi - punch[1];
+            } else {                                   // no target: just cancel recoil
+                pitch = cmd->viewangles[0] - punch[0]; yaw = cmd->viewangles[1] - punch[1];
             }
+            while (yaw > 180.0f) yaw -= 360.0f; while (yaw < -180.0f) yaw += 360.0f;
+            if (pitch > 89.0f) pitch = 89.0f; if (pitch < -89.0f) pitch = -89.0f;
+            const float dd = (yaw - cmd->viewangles[1]) * kPi / 180.0f;
+            const float f = cmd->forwardmove, sd = cmd->sidemove;
+            cmd->forwardmove = f * cosf(dd) - sd * sinf(dd);
+            cmd->sidemove = f * sinf(dd) + sd * cosf(dd);
+            cmd->viewangles[0] = pitch; cmd->viewangles[1] = yaw;
         }
     }
 
@@ -519,13 +539,13 @@ namespace {
     }
 
     void Slider(Ui& u, int x, int y, int w, const char* label, volatile LONG* v, int lo, int hi, const char* suffix = "%") {
-        static bool drag = false;
+        static volatile LONG* dragging = nullptr;
         char buf[96]; sprintf_s(buf, "%s: %ld%s", label, (long)*v, suffix);
         Text(u.dc, x + 6, y, buf, kText);
         const int tx = x + 6, ty = y + 26, tw = w - 12;
-        if (u.click && Hit(u, tx - 4, ty - 8, tw + 8, 22)) drag = true;
-        if (!u.held) drag = false;
-        if (drag) {
+        if (u.click && Hit(u, tx - 4, ty - 8, tw + 8, 22)) dragging = v;
+        if (!u.held) dragging = nullptr;
+        if (dragging == v) {
             float f = (float)(u.cx - tx) / (float)tw; if (f < 0) f = 0; if (f > 1) f = 1;
             InterlockedExchange(v, lo + (LONG)(f * (hi - lo) + 0.5f));
         }
@@ -563,18 +583,17 @@ namespace {
             Checkbox(u, x, y, w, "Enabled", &g_enabled);                                   y += 30;
             Text(u.dc, x + 6, y, "Conditions", kDim);                                      y += 22;
             Checkbox(u, x, y, w, "Team check (don't shoot teammates)", &g_opt.teamCheck);  y += 28;
-            Checkbox(u, x, y, w, "Only on ground", &g_opt.ground);                         y += 28;
-            Checkbox(u, x, y, w, "Speed limit (accuracy)", &g_opt.speedCheck);             y += 28;
-            Checkbox(u, x, y, w, "Snipers: scope required", &g_opt.scopeCheck);            y += 34;
+            Checkbox(u, x, y, w, "Only shoot on ground", &g_opt.ground);                         y += 28;
+            Checkbox(u, x, y, w, "Stand still before shot (accuracy)", &g_opt.speedCheck);             y += 28;
+            Checkbox(u, x, y, w, "Snipers: auto-scope before shot", &g_opt.scopeCheck);            y += 34;
             Text(u.dc, x + 6, y, "Tuning", kDim);                                          y += 22;
             Slider(u, x, y, w, "Shot interval (lower = faster)", &g_opt.intervalPct, 50, 200);
         } else if (tab == 2) {
             Checkbox(u, x, y, w, "FOV aim assist", &g_opt.aimOn);                          y += 30;
             Checkbox(u, x, y, w, "Aim at head (off = chest)", &g_opt.aimHead);             y += 34;
-            Slider(u, x, y, w, "FOV radius", &g_opt.aimFov, 1, 40, " deg");                y += 50;
-            Slider(u, x, y, w, "Head lead (moving targets)", &g_opt.headLead, 0, 200, " ms"); y += 50;
-            Text(u.dc, x + 6, y, "Works while you fire, enemy team only,", kDim);         y += 20;
-            Text(u.dc, x + 6, y, "target must be visible. Bots-only game.", kDim);
+            Slider(u, x, y, w, "FOV radius", &g_opt.aimFov, 1, 180, " deg");                y += 50;
+            Text(u.dc, x + 6, y, "Works while you fire + cancels recoil.",, kDim);         y += 20;
+            Text(u.dc, x + 6, y, "Enemy team only, target must be visible.", kDim);
         } else {
             Checkbox(u, x, y, w, "Enemy ESP (green boxes, through walls)", &g_opt.esp);   y += 30;
             Checkbox(u, x, y, w, "Widescreen FOV (Hor+) - flip if boxes drift", &g_opt.wideFov); y += 34;
