@@ -592,7 +592,7 @@ namespace {
             Checkbox(u, x, y, w, "FOV aim assist", &g_opt.aimOn);                          y += 30;
             Checkbox(u, x, y, w, "Aim at head (off = chest)", &g_opt.aimHead);             y += 34;
             Slider(u, x, y, w, "FOV radius", &g_opt.aimFov, 1, 180, " deg");                y += 50;
-            Text(u.dc, x + 6, y, "Works while you fire + cancels recoil.",, kDim);         y += 20;
+            Text(u.dc, x + 6, y, "Works while you fire + cancels recoil.", kDim);         y += 20;
             Text(u.dc, x + 6, y, "Enemy team only, target must be visible.", kDim);
         } else {
             Checkbox(u, x, y, w, "Enemy ESP (green boxes, through walls)", &g_opt.esp);   y += 30;
