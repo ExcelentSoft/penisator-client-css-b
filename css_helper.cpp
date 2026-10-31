@@ -61,6 +61,7 @@ namespace {
         volatile LONG aimOn = 0;
         volatile LONG aimHead = 1;
         volatile LONG aimFov = 10;
+        volatile LONG headLead = 70;   // ms of target movement to lead when aiming at the head
     } g_opt;
 
     HMODULE g_self = nullptr;
@@ -244,7 +245,7 @@ namespace {
     }
 
     // ---------------- per-frame logic (runs inside CInput::CreateMove, game thread) ----------------
-    struct Target { int idx; float feet[3]; bool duck; };
+    struct Target { int idx; float feet[3]; bool duck; float vel[3]; };
 
     void CheckBotsOnly(int local, int maxc, bool ingame) {
         bool humans = false; char who[48] = "";
@@ -296,6 +297,9 @@ namespace {
         Target targets[32]; int nt = 0;
         g_playerPtrCount = 0;
         static DWORD lastSim[65]; static DWORD lastSimChange[65];
+        // own velocity estimate per player (client does not get other players' velocity)
+        static float vPos[65][3], vVel[65][3]; static LONGLONG vT[65];
+        const LONGLONG qNow = Now();
         const DWORD nowMs = GetTickCount();
         for (int i = 1; i <= maxc && i <= 32; ++i) {
             void* e = GetEnt(i);
@@ -313,6 +317,22 @@ namespace {
             t.idx = i;
             t.feet[0] = Rd<float>(e, OFF_ORIGIN); t.feet[1] = Rd<float>(e, OFF_ORIGIN + 4); t.feet[2] = Rd<float>(e, OFF_ORIGIN + 8);
             t.duck = (Rd<int>(e, OFF_FLAGS) & FL_DUCKING) != 0;
+            {
+                const float dtS = vT[i] ? (float)(qNow - vT[i]) / (float)g_qpcFreq : 999.0f;
+                const bool moved = fabsf(t.feet[0] - vPos[i][0]) + fabsf(t.feet[1] - vPos[i][1]) + fabsf(t.feet[2] - vPos[i][2]) > 0.01f;
+                if (dtS > 0.3f) { for (int c = 0; c < 3; ++c) vVel[i][c] = 0.0f; for (int c = 0; c < 3; ++c) vPos[i][c] = t.feet[c]; vT[i] = qNow; }
+                else if (moved) {
+                    if (dtS > 0.004f) {
+                        for (int c = 0; c < 3; ++c) vVel[i][c] = 0.5f * vVel[i][c] + 0.5f * (t.feet[c] - vPos[i][c]) / dtS;
+                        for (int c = 0; c < 3; ++c) vPos[i][c] = t.feet[c];
+                        vT[i] = qNow;
+                    }
+                } else if (dtS > 0.15f) { for (int c = 0; c < 3; ++c) vVel[i][c] = 0.0f; }
+                for (int c = 0; c < 3; ++c) t.vel[c] = vVel[i][c];
+                float sp = sqrtf(t.vel[0] * t.vel[0] + t.vel[1] * t.vel[1]);
+                if (sp > 400.0f) { t.vel[0] = t.vel[1] = 0.0f; }   // teleport / respawn glitch
+                t.vel[2] = 0.0f;
+            }
         }
 
         // view direction (this command) incl. recoil punch
@@ -376,10 +396,12 @@ namespace {
             float bestAng = (float)g_opt.aimFov; float bp[3]; bool found = false;
             for (int k = 0; k < nt; ++k) {
                 const bool d = targets[k].duck;
-                const float headZ = d ? 49.0f : 67.0f, chestZ = d ? 32.0f : 46.0f;
+                const float headZ = d ? 48.0f : 66.0f, chestZ = d ? 32.0f : 46.0f;
+                const float lead = g_opt.aimHead ? (float)g_opt.headLead * 0.001f : 0.0f;
                 const float zs[2] = { g_opt.aimHead ? headZ : chestZ, g_opt.aimHead ? chestZ : headZ };
                 for (int j = 0; j < 2; ++j) {
-                    const float pt[3] = { targets[k].feet[0], targets[k].feet[1], targets[k].feet[2] + zs[j] };
+                    const float ld = (j == 0 && g_opt.aimHead) ? lead : 0.0f;
+                    const float pt[3] = { targets[k].feet[0] + targets[k].vel[0] * ld, targets[k].feet[1] + targets[k].vel[1] * ld, targets[k].feet[2] + zs[j] };
                     float dv[3] = { pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2] };
                     const float len = sqrtf(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
                     if (len < 1.0f) continue;
@@ -550,6 +572,7 @@ namespace {
             Checkbox(u, x, y, w, "FOV aim assist", &g_opt.aimOn);                          y += 30;
             Checkbox(u, x, y, w, "Aim at head (off = chest)", &g_opt.aimHead);             y += 34;
             Slider(u, x, y, w, "FOV radius", &g_opt.aimFov, 1, 40, " deg");                y += 50;
+            Slider(u, x, y, w, "Head lead (moving targets)", &g_opt.headLead, 0, 200, " ms"); y += 50;
             Text(u.dc, x + 6, y, "Works while you fire, enemy team only,", kDim);         y += 20;
             Text(u.dc, x + 6, y, "target must be visible. Bots-only game.", kDim);
         } else {
