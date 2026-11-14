@@ -29,7 +29,7 @@ namespace {
                   OFF_VIEWOFS = 212, OFF_VEL = 224, OFF_PUNCH = 2992, OFF_FOV = 3356, OFF_DEFFOV = 3368,
                   OFF_ACTWEAPON = 2872, OFF_SIMTIME = 104;
     constexpr int FL_ONGROUND = 1 << 0, FL_DUCKING = 1 << 1;
-    constexpr int IN_ATTACK = 1, IN_ATTACK2 = 1 << 11;
+    constexpr int IN_ATTACK = 1, IN_ATTACK2 = 1 << 11, IN_JUMP = 1 << 1;
     constexpr int kPlayerInfoFakeOffset = 108;                    // player_info_t::fakeplayer
 
     // IVEngineClient012 vtable indices
@@ -61,6 +61,9 @@ namespace {
         volatile LONG aimOn = 0;
         volatile LONG aimHead = 1;
         volatile LONG aimFov = 10;
+        volatile LONG espBox = 1, espHp = 1, espName = 1, espDist = 1, espAimed = 1, espColor = 0;
+        volatile LONG aimSmooth = 0, aimSpeed = 30, aimPrio = 0;
+        volatile LONG bhop = 0, autoStrafe = 0;
     } g_opt;
 
     HMODULE g_self = nullptr;
@@ -73,6 +76,41 @@ namespace {
     volatile LONG g_botsOnly = 0;     // 1 = verified: only bots present
     char g_lockWho[48] = "";
     LONGLONG g_qpcFreq = 0, g_nextShot = 0, g_nextScope = 0;
+
+    // ---------------- config (ini next to the dll) ----------------
+    struct CfgEntry { const char* key; volatile LONG* v; LONG def, lo, hi; };
+    CfgEntry g_cfg[] = {
+        { "trigger", &g_enabled, 0, 0, 1 }, { "teamCheck", &g_opt.teamCheck, 1, 0, 1 }, { "ground", &g_opt.ground, 0, 0, 1 },
+        { "standStill", &g_opt.speedCheck, 0, 0, 1 }, { "autoScope", &g_opt.scopeCheck, 1, 0, 1 },
+        { "shotInterval", &g_opt.intervalPct, 100, 50, 200 },
+        { "esp", &g_opt.esp, 0, 0, 1 }, { "espBox", &g_opt.espBox, 1, 0, 1 }, { "espHp", &g_opt.espHp, 1, 0, 1 },
+        { "espName", &g_opt.espName, 1, 0, 1 }, { "espDist", &g_opt.espDist, 1, 0, 1 }, { "espAimed", &g_opt.espAimed, 1, 0, 1 },
+        { "espColor", &g_opt.espColor, 0, 0, 5 }, { "wideFov", &g_opt.wideFov, 1, 0, 1 },
+        { "aim", &g_opt.aimOn, 0, 0, 1 }, { "aimHead", &g_opt.aimHead, 1, 0, 1 }, { "aimFov", &g_opt.aimFov, 10, 1, 180 },
+        { "aimSmooth", &g_opt.aimSmooth, 0, 0, 1 }, { "aimSpeed", &g_opt.aimSpeed, 30, 1, 100 }, { "aimPrio", &g_opt.aimPrio, 0, 0, 2 },
+        { "bhop", &g_opt.bhop, 0, 0, 1 }, { "autoStrafe", &g_opt.autoStrafe, 0, 0, 1 },
+    };
+    bool CfgPath(char* out, size_t n) {
+        if (!GetModuleFileNameA(g_self, out, (DWORD)n)) return false;
+        char* sl = strrchr(out, '\\'); if (!sl) return false;
+        strcpy_s(sl + 1, n - (size_t)(sl + 1 - out), "css_helper.ini");
+        return true;
+    }
+    void CfgSave() {
+        char path[MAX_PATH]; if (!CfgPath(path, MAX_PATH)) return;
+        for (auto& e : g_cfg) { char b[16]; sprintf_s(b, "%ld", (long)*e.v); WritePrivateProfileStringA("css", e.key, b, path); }
+    }
+    void CfgLoad() {
+        char path[MAX_PATH]; if (!CfgPath(path, MAX_PATH)) return;
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return;
+        for (auto& e : g_cfg) {
+            LONG v = (LONG)GetPrivateProfileIntA("css", e.key, e.def, path);
+            if (v < e.lo) v = e.lo; if (v > e.hi) v = e.hi;
+            InterlockedExchange(e.v, v);
+        }
+    }
+    void CfgReset() { for (auto& e : g_cfg) InterlockedExchange(e.v, e.def); }
+    char g_names[65][32] = {};
 
     // ---------------- engine interfaces ----------------
     typedef void* (__cdecl* CreateInterfaceFn)(const char*, int*);
@@ -206,7 +244,7 @@ namespace {
     // ---------------- ESP snapshot ----------------
     struct EspSnap {
         float eye[3]; float ang[3]; float fov; DWORD t; int n;
-        float feet[32][3]; unsigned char duck[32];
+        float feet[32][3]; unsigned char duck[32]; int idx[32]; int hp[32]; unsigned char aimed[32];
     };
     EspSnap g_espBuf = {};
     volatile LONG g_espSeq = 0;
@@ -244,7 +282,7 @@ namespace {
     }
 
     // ---------------- per-frame logic (runs inside CInput::CreateMove, game thread) ----------------
-    struct Target { int idx; void* ent; float feet[3]; bool duck; };
+    struct Target { int idx; void* ent; float feet[3]; bool duck; int hp; };
 
     void CheckBotsOnly(int local, int maxc, bool ingame) {
         bool humans = false; char who[48] = "";
@@ -253,6 +291,7 @@ namespace {
             if (i == local) continue;
             char pi[400]; memset(pi, 0, sizeof(pi));
             const bool ok = ((PInfoFn)EVT()[E_GETPLAYERINFO])(g_engine, i, pi);
+            if (i < 65) { if (ok && pi[0]) strncpy_s(g_names[i], pi, 31); else g_names[i][0] = 0; }
             if (ok && pi[0] && !pi[kPlayerInfoFakeOffset]) { humans = true; strncpy_s(who, pi, 32); break; }
         }
         if (humans) { strcpy_s(g_lockWho, who); InterlockedExchange(&g_botsOnly, 0); }
@@ -321,6 +360,15 @@ namespace {
         const float vel[2] = { Rd<float>(me, OFF_VEL), Rd<float>(me, OFF_VEL + 4) };
         const int myFlags = Rd<int>(me, OFF_FLAGS);
 
+        // ---- bunnyhop / autostrafe
+        if (g_opt.bhop && (cmd->buttons & IN_JUMP) && !(myFlags & FL_ONGROUND)) {
+            cmd->buttons &= ~IN_JUMP;
+            if (g_opt.autoStrafe) {
+                if (cmd->mousedx < 0) cmd->sidemove = -400.0f;
+                else if (cmd->mousedx > 0) cmd->sidemove = 400.0f;
+            }
+        }
+
         // ---- collect enemy targets (and player pointers for the wall-check filter)
         Target targets[32]; int nt = 0;
         g_playerPtrCount = 0;
@@ -342,6 +390,7 @@ namespace {
             t.idx = i; t.ent = e;
             t.feet[0] = Rd<float>(e, OFF_ORIGIN); t.feet[1] = Rd<float>(e, OFF_ORIGIN + 4); t.feet[2] = Rd<float>(e, OFF_ORIGIN + 8);
             t.duck = (Rd<int>(e, OFF_FLAGS) & FL_DUCKING) != 0;
+            t.hp = Rd<int>(e, OFF_HEALTH);
         }
 
         // view direction (this command) incl. recoil punch
@@ -357,7 +406,14 @@ namespace {
             s.t = nowMs;
             for (int k = 0; k < nt && s.n < 32; ++k) {
                 for (int c = 0; c < 3; ++c) s.feet[s.n][c] = targets[k].feet[c];
-                s.duck[s.n] = targets[k].duck ? 1 : 0; ++s.n;
+                s.duck[s.n] = targets[k].duck ? 1 : 0; s.idx[s.n] = targets[k].idx; s.hp[s.n] = targets[k].hp;
+                {
+                    const float hh = targets[k].duck ? 54.0f : 72.0f;
+                    const float tc = RayCylinder(eye, fwd, targets[k].feet[0], targets[k].feet[1], targets[k].feet[2], targets[k].feet[2] + hh - 10.0f, 11.0f);
+                    const float hc[3] = { targets[k].feet[0], targets[k].feet[1], targets[k].feet[2] + hh - 6.0f };
+                    s.aimed[s.n] = (tc >= 0.0f || RaySphere(eye, fwd, hc, 7.5f) >= 0.0f) ? 1 : 0;
+                }
+                ++s.n;
             }
             InterlockedIncrement(&g_espSeq); g_espBuf = s; InterlockedIncrement(&g_espSeq);
         }
@@ -401,9 +457,10 @@ namespace {
             } while (0);
         }
 
-        // ---- FOV aim assist (silent): only while firing
+        // ---- FOV aim assist: only while firing
         if (g_opt.aimOn && (cmd->buttons & IN_ATTACK)) {
-            float bestAng = (float)g_opt.aimFov; float bp[3]; bool found = false;
+            const float fovLimit = (float)g_opt.aimFov;
+            float bestScore = 1e30f; float bp[3] = { 0, 0, 0 }, bestDist = 0.0f; bool found = false;
             auto angTo = [&](const float* pt) -> float {
                 const float dv[3] = { pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2] };
                 const float len = sqrtf(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
@@ -422,12 +479,17 @@ namespace {
                     if (wantHead) {
                         pt[0] = gh[0]; pt[1] = gh[1]; pt[2] = gh[2];
                         float hp[3];
-                        if (angTo(gh) < bestAng + 10.0f && HeadPoint(targets[k].ent, eye, gh, hp)) { pt[0] = hp[0]; pt[1] = hp[1]; pt[2] = hp[2]; }
+                        if (angTo(gh) < fovLimit + 10.0f && HeadPoint(targets[k].ent, eye, gh, hp)) { pt[0] = hp[0]; pt[1] = hp[1]; pt[2] = hp[2]; }
                     } else { pt[0] = gc[0]; pt[1] = gc[1]; pt[2] = gc[2]; }
                     const float ang = angTo(pt);
-                    if (ang >= bestAng) continue;
+                    if (ang >= fovLimit) continue;
                     if (!ClearLine(eye, pt)) continue;
-                    bestAng = ang; bp[0] = pt[0]; bp[1] = pt[1]; bp[2] = pt[2]; found = true; break;
+                    const float dist = sqrtf((pt[0] - eye[0]) * (pt[0] - eye[0]) + (pt[1] - eye[1]) * (pt[1] - eye[1]) + (pt[2] - eye[2]) * (pt[2] - eye[2]));
+                    float score = ang;                                            // 0: closest to crosshair
+                    if (g_opt.aimPrio == 1) score = dist;                         // 1: closest by distance
+                    else if (g_opt.aimPrio == 2) score = (float)targets[k].hp * 1000.0f + ang;   // 2: lowest health
+                    if (score < bestScore) { bestScore = score; bestDist = dist; bp[0] = pt[0]; bp[1] = pt[1]; bp[2] = pt[2]; found = true; }
+                    break;
                 }
             }
             float pitch, yaw;
@@ -440,7 +502,23 @@ namespace {
             }
             while (yaw > 180.0f) yaw -= 360.0f; while (yaw < -180.0f) yaw += 360.0f;
             if (pitch > 89.0f) pitch = 89.0f; if (pitch < -89.0f) pitch = -89.0f;
-            const float dd = (yaw - cmd->viewangles[1]) * kPi / 180.0f;
+            const float oldYaw = cmd->viewangles[1];
+            if (found && g_opt.aimSmooth) {
+                // visible smooth aim: move the real view a fraction of the way each tick, shoot only when aligned
+                const float k = (float)g_opt.aimSpeed * 0.01f;
+                float dp = pitch - cmd->viewangles[0], dyw = yaw - cmd->viewangles[1];
+                while (dyw > 180.0f) dyw -= 360.0f; while (dyw < -180.0f) dyw += 360.0f;
+                const float err = sqrtf(dp * dp + dyw * dyw);
+                float np = cmd->viewangles[0] + dp * k, ny = cmd->viewangles[1] + dyw * k;
+                if (err < 0.15f) { np = pitch; ny = yaw; }
+                while (ny > 180.0f) ny -= 360.0f; while (ny < -180.0f) ny += 360.0f;
+                const float remain = err * (1.0f - k);
+                if (remain * kPi / 180.0f * bestDist > 5.0f) cmd->buttons &= ~IN_ATTACK;   // not aligned yet: hold fire
+                pitch = np; yaw = ny;
+                float nv[3] = { pitch, yaw, 0.0f };
+                ((VecFn)EVT()[E_SETVIEWANG])(g_engine, nv);
+            }
+            const float dd = (yaw - oldYaw) * kPi / 180.0f;
             const float f = cmd->forwardmove, sd = cmd->sidemove;
             cmd->forwardmove = f * cosf(dd) - sd * sinf(dd);
             cmd->sidemove = f * sinf(dd) + sd * cosf(dd);
@@ -558,8 +636,19 @@ namespace {
         HBRUSH k = CreateSolidBrush(kText); FillRect(u.dc, &kn, k); DeleteObject(k);
     }
 
+    bool Button(Ui& u, int x, int y, int w, int h, const char* label) {
+        const bool hot = Hit(u, x, y, w, h);
+        RECT r = { x, y, x + w, y + h };
+        HBRUSH hb = CreateSolidBrush(hot ? RGB(52, 58, 74) : kPanel); FillRect(u.dc, &r, hb); DeleteObject(hb);
+        HBRUSH bd = CreateSolidBrush(kOff); FrameRect(u.dc, &r, bd); DeleteObject(bd);
+        Text(u.dc, x + 10, y + (h - 16) / 2, label, kText);
+        return hot && u.click;
+    }
+
+    const unsigned char kEspCols[6][3] = { { 0, 255, 70 }, { 255, 50, 50 }, { 0, 220, 255 }, { 255, 230, 0 }, { 255, 255, 255 }, { 255, 0, 220 } };
+
     void DrawMenu(Ui& u) {
-        const int W = 380, H = 380;
+        const int W = 380, H = 440;
         const int x0 = 0, y0 = 0;
         RECT panel = { x0, y0, x0 + W, y0 + H };
         HBRUSH pb = CreateSolidBrush(kBg); FillRect(u.dc, &panel, pb); DeleteObject(pb);
@@ -569,13 +658,13 @@ namespace {
         Text(u.dc, x0 + 14, y0 + 8, "CS:S v34  |  Menu", kAccent);
 
         static int tab = 0;
-        const char* names[3] = { "Triggerbot", "Visuals", "Aim" };
-        for (int t = 0; t < 3; ++t) {
-            const int tx = x0 + 10 + t * 112;
-            if (u.click && Hit(u, tx, y0 + 44, 106, 26)) tab = t;
-            RECT tr = { tx, y0 + 44, tx + 106, y0 + 70 };
+        const char* names[4] = { "Trigger", "Visuals", "Aim", "Misc" };
+        for (int t = 0; t < 4; ++t) {
+            const int tx = x0 + 10 + t * 91;
+            if (u.click && Hit(u, tx, y0 + 44, 86, 26)) tab = t;
+            RECT tr = { tx, y0 + 44, tx + 86, y0 + 70 };
             HBRUSH tbr = CreateSolidBrush(tab == t ? kAccent : kPanel); FillRect(u.dc, &tr, tbr); DeleteObject(tbr);
-            Text(u.dc, tx + 12, y0 + 49, names[t], tab == t ? RGB(15, 20, 15) : kText);
+            Text(u.dc, tx + 14, y0 + 49, names[t], tab == t ? RGB(15, 20, 15) : kText);
         }
 
         const int x = x0 + 12, w = W - 24; int y = y0 + 84;
@@ -583,22 +672,50 @@ namespace {
             Checkbox(u, x, y, w, "Enabled", &g_enabled);                                   y += 30;
             Text(u.dc, x + 6, y, "Conditions", kDim);                                      y += 22;
             Checkbox(u, x, y, w, "Team check (don't shoot teammates)", &g_opt.teamCheck);  y += 28;
-            Checkbox(u, x, y, w, "Only shoot on ground", &g_opt.ground);                         y += 28;
-            Checkbox(u, x, y, w, "Stand still before shot (accuracy)", &g_opt.speedCheck);             y += 28;
-            Checkbox(u, x, y, w, "Snipers: auto-scope before shot", &g_opt.scopeCheck);            y += 34;
+            Checkbox(u, x, y, w, "Only shoot on ground", &g_opt.ground);                   y += 28;
+            Checkbox(u, x, y, w, "Stand still before shot (accuracy)", &g_opt.speedCheck); y += 28;
+            Checkbox(u, x, y, w, "Snipers: auto-scope before shot", &g_opt.scopeCheck);    y += 34;
             Text(u.dc, x + 6, y, "Tuning", kDim);                                          y += 22;
             Slider(u, x, y, w, "Shot interval (lower = faster)", &g_opt.intervalPct, 50, 200);
-        } else if (tab == 2) {
-            Checkbox(u, x, y, w, "FOV aim assist", &g_opt.aimOn);                          y += 30;
-            Checkbox(u, x, y, w, "Aim at head (off = chest)", &g_opt.aimHead);             y += 34;
-            Slider(u, x, y, w, "FOV radius", &g_opt.aimFov, 1, 180, " deg");                y += 50;
-            Text(u.dc, x + 6, y, "Works while you fire + cancels recoil.", kDim);         y += 20;
-            Text(u.dc, x + 6, y, "Enemy team only, target must be visible.", kDim);
-        } else {
-            Checkbox(u, x, y, w, "Enemy ESP (green boxes, through walls)", &g_opt.esp);   y += 30;
+        } else if (tab == 1) {
+            Checkbox(u, x, y, w, "Enemy ESP (through walls)", &g_opt.esp);                y += 28;
+            Checkbox(u, x, y, w, "Box", &g_opt.espBox);                                    y += 28;
+            Checkbox(u, x, y, w, "Health bar", &g_opt.espHp);                              y += 28;
+            Checkbox(u, x, y, w, "Name", &g_opt.espName);                                  y += 28;
+            Checkbox(u, x, y, w, "Distance", &g_opt.espDist);                              y += 28;
+            Checkbox(u, x, y, w, "Highlight target under crosshair", &g_opt.espAimed);     y += 32;
+            Text(u.dc, x + 6, y + 1, "Color", kText);
+            for (int i = 0; i < 6; ++i) {
+                const int sx = x + 70 + i * 40;
+                if (u.click && Hit(u, sx, y, 32, 20)) InterlockedExchange(&g_opt.espColor, i);
+                RECT sr = { sx, y, sx + 32, y + 20 };
+                HBRUSH sb2 = CreateSolidBrush(RGB(kEspCols[i][0], kEspCols[i][1], kEspCols[i][2])); FillRect(u.dc, &sr, sb2); DeleteObject(sb2);
+                if (g_opt.espColor == i) { HBRUSH fb = CreateSolidBrush(RGB(255, 255, 255)); FrameRect(u.dc, &sr, fb); RECT s2 = { sx + 1, y + 1, sx + 31, y + 19 }; FrameRect(u.dc, &s2, fb); DeleteObject(fb); }
+            }
+            y += 34;
             Checkbox(u, x, y, w, "Widescreen FOV (Hor+) - flip if boxes drift", &g_opt.wideFov); y += 34;
-            Text(u.dc, x + 6, y, "Draws enemy-team players only.", kDim);                 y += 20;
-            Text(u.dc, x + 6, y, "Drawn inside the game (fullscreen ok).", kDim);
+            Text(u.dc, x + 6, y, "Draws enemy-team players only.", kDim);
+        } else if (tab == 2) {
+            Checkbox(u, x, y, w, "FOV aim assist", &g_opt.aimOn);                          y += 28;
+            Checkbox(u, x, y, w, "Aim at head (off = chest)", &g_opt.aimHead);             y += 28;
+            Checkbox(u, x, y, w, "Smooth aim (visible, off = silent)", &g_opt.aimSmooth);  y += 34;
+            Slider(u, x, y, w, "Smooth speed (higher = faster)", &g_opt.aimSpeed, 1, 100);  y += 50;
+            Slider(u, x, y, w, "FOV radius", &g_opt.aimFov, 1, 180, " deg");               y += 50;
+            const char* pn[3] = { "Priority: closest to crosshair", "Priority: closest by distance", "Priority: lowest health" };
+            if (Button(u, x, y, w, 26, pn[g_opt.aimPrio % 3])) InterlockedExchange(&g_opt.aimPrio, (g_opt.aimPrio + 1) % 3);
+            y += 38;
+            Text(u.dc, x + 6, y, "Works while you fire + cancels recoil.", kDim);         y += 20;
+            Text(u.dc, x + 6, y, "Smooth mode waits until aimed, then shoots.", kDim);
+        } else {
+            Checkbox(u, x, y, w, "Bunnyhop (hold space)", &g_opt.bhop);                   y += 28;
+            Checkbox(u, x, y, w, "Auto-strafe (in air, follows mouse)", &g_opt.autoStrafe); y += 40;
+            Text(u.dc, x + 6, y, "Config", kDim);                                          y += 24;
+            if (Button(u, x, y, 108, 28, "Save")) CfgSave();
+            if (Button(u, x + 116, y, 108, 28, "Load")) CfgLoad();
+            if (Button(u, x + 232, y, 108, 28, "Reset")) CfgReset();
+            y += 42;
+            Text(u.dc, x + 6, y, "Saved automatically when the menu closes.", kDim);     y += 20;
+            Text(u.dc, x + 6, y, "File: css_helper.ini next to the dll.", kDim);
         }
         Text(u.dc, x0 + 14, y0 + H - 26, "RShift - close menu   |   END - unload", kDim);
     }
@@ -639,6 +756,28 @@ namespace {
         void Free() { if (dc) DeleteDC(dc); if (bmp) DeleteObject(bmp); dc = nullptr; bmp = nullptr; px = nullptr; }
     };
     struct Tex { IDirect3DTexture9* t = nullptr; };
+    struct VCT { float x, y, z, rhw; DWORD c; float u, v; };
+    VCT g_vct[6144]; int g_nvct = 0;
+    Canvas g_atlasCv; Tex g_atlasTex; HFONT g_fEsp = nullptr; int g_adv[95];
+    const int kAtlasW = 256, kAtlasH = 128, kCell = 16;
+    int TextWidth(const char* t) { int w = 0; for (; *t; ++t) { const int c = (unsigned char)*t - 32; w += (c >= 0 && c < 95) ? g_adv[c] : 0; } return w; }
+    void GlyphQuads(int x, int y, const char* t, DWORD col) {
+        for (; *t; ++t) {
+            const int c = (unsigned char)*t - 32; if (c < 0 || c >= 95) continue;
+            const int cx = (c % 16) * kCell, cy = (c / 16) * kCell, a = g_adv[c];
+            if (g_nvct + 6 > 6144) return;
+            const float x0 = (float)x - 0.5f, y0 = (float)y - 0.5f, x1 = (float)(x + a) - 0.5f, y1 = (float)(y + 15) - 0.5f;
+            const float u0 = (float)cx / kAtlasW, u1 = (float)(cx + a) / kAtlasW, v0 = (float)cy / kAtlasH, v1 = (float)(cy + 15) / kAtlasH;
+            const VCT p0 = { x0, y0, 0, 1, col, u0, v0 }, p1 = { x1, y0, 0, 1, col, u1, v0 }, p2 = { x1, y1, 0, 1, col, u1, v1 }, p3 = { x0, y1, 0, 1, col, u0, v1 };
+            g_vct[g_nvct++] = p0; g_vct[g_nvct++] = p1; g_vct[g_nvct++] = p2;
+            g_vct[g_nvct++] = p0; g_vct[g_nvct++] = p2; g_vct[g_nvct++] = p3;
+            x += a;
+        }
+    }
+    void DrawString(int x, int y, const char* t, DWORD col) {
+        GlyphQuads(x + 1, y + 1, t, D3DCOLOR_ARGB(255, 0, 0, 0));
+        GlyphQuads(x, y, t, col);
+    }
 
     void Upload(Tex& t, Canvas& c) {
         D3DLOCKED_RECT lr;
@@ -713,23 +852,42 @@ namespace {
     Canvas g_menuCv, g_hudCv; Tex g_menuTex, g_hudTex;
     HFONT g_fMenu = nullptr, g_fHud = nullptr;
     char g_hudKey[256] = "";
-    const int kMenuTex = 512, kHudW = 512, kHudH = 128, kMenuW = 380, kMenuH = 380, kHudUsedW = 320, kHudUsedH = 96;
+    const int kMenuTex = 512, kHudW = 512, kHudH = 128, kMenuW = 380, kMenuH = 440, kHudUsedW = 320, kHudUsedH = 96;
 
     void FreeRes() {
         if (g_menuTex.t) { g_menuTex.t->Release(); g_menuTex.t = nullptr; }
         if (g_hudTex.t) { g_hudTex.t->Release(); g_hudTex.t = nullptr; }
-        g_menuCv.Free(); g_hudCv.Free();
+        g_menuCv.Free(); g_hudCv.Free(); g_atlasCv.Free();
+        if (g_atlasTex.t) { g_atlasTex.t->Release(); g_atlasTex.t = nullptr; }
+        if (g_fEsp) { DeleteObject(g_fEsp); g_fEsp = nullptr; }
         if (g_fMenu) { DeleteObject(g_fMenu); g_fMenu = nullptr; }
         if (g_fHud) { DeleteObject(g_fHud); g_fHud = nullptr; }
         g_hudKey[0] = 0;
     }
 
     bool EnsureRes(IDirect3DDevice9* dev) {
-        if (g_menuTex.t && g_hudTex.t) return true;
+        if (g_menuTex.t && g_hudTex.t && g_atlasTex.t) return true;
         FreeRes();
         if (!g_menuCv.Init(kMenuTex, kMenuTex) || !g_hudCv.Init(kHudW, kHudH)) { FreeRes(); return false; }
         if (FAILED(dev->CreateTexture(kMenuTex, kMenuTex, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_menuTex.t, nullptr)) ||
             FAILED(dev->CreateTexture(kHudW, kHudH, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_hudTex.t, nullptr))) { FreeRes(); return false; }
+        if (!g_atlasCv.Init(kAtlasW, kAtlasH) ||
+            FAILED(dev->CreateTexture(kAtlasW, kAtlasH, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_atlasTex.t, nullptr))) { FreeRes(); return false; }
+        g_fEsp = CreateFontA(13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Tahoma");
+        {
+            g_atlasCv.Clear();
+            HGDIOBJ of = SelectObject(g_atlasCv.dc, g_fEsp);
+            SetTextColor(g_atlasCv.dc, RGB(255, 255, 255));
+            for (int c = 0; c < 95; ++c) {
+                char ch = (char)(c + 32); SIZE sz = { 0, 0 };
+                GetTextExtentPoint32A(g_atlasCv.dc, &ch, 1, &sz);
+                g_adv[c] = sz.cx < 1 ? 1 : (sz.cx > kCell ? kCell : sz.cx);
+                TextOutA(g_atlasCv.dc, (c % 16) * kCell, (c / 16) * kCell, &ch, 1);
+            }
+            SelectObject(g_atlasCv.dc, of);
+            g_atlasCv.Finish(); Upload(g_atlasTex, g_atlasCv);
+        }
         g_fMenu = CreateFontA(16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
         g_fHud = CreateFontA(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
@@ -811,7 +969,34 @@ namespace {
                         if (y < miny) miny = y; if (y > maxy) maxy = y;
                     }
                     if (!ok || maxx - minx > sw * 2 || maxy - miny > sh * 2) continue;
-                    BoxOutline(floorf(minx), floorf(miny), floorf(maxx), floorf(maxy), 2.0f, D3DCOLOR_XRGB(0, 255, 70));
+                    const int ci = (int)(g_opt.espColor % 6);
+                    DWORD col = D3DCOLOR_XRGB(kEspCols[ci][0], kEspCols[ci][1], kEspCols[ci][2]);
+                    if (g_opt.espAimed && es.aimed[i]) col = D3DCOLOR_XRGB(255, 255, 255);
+                    const float bx0 = floorf(minx), by0 = floorf(miny), bx1 = floorf(maxx), by1 = floorf(maxy);
+                    if (g_opt.espBox) {
+                        BoxOutline(bx0 - 1, by0 - 1, bx1 + 1, by1 + 1, 4.0f, D3DCOLOR_ARGB(160, 0, 0, 0));
+                        BoxOutline(bx0, by0, bx1, by1, 2.0f, col);
+                    }
+                    if (g_opt.espHp) {
+                        float hpf = (float)es.hp[i] / 100.0f; if (hpf > 1.0f) hpf = 1.0f; if (hpf < 0.0f) hpf = 0.0f;
+                        const float bh = by1 - by0;
+                        Quad(bx0 - 7, by0 - 1, 5, bh + 2, D3DCOLOR_ARGB(190, 0, 0, 0));
+                        Quad(bx0 - 6, by1 - bh * hpf, 3, bh * hpf, D3DCOLOR_XRGB((int)(255 * (1.0f - hpf)), (int)(255 * hpf), 0));
+                    }
+                    const int mid = (int)((bx0 + bx1) * 0.5f);
+                    if (g_opt.espName && es.idx[i] >= 0 && es.idx[i] < 65 && g_names[es.idx[i]][0]) {
+                        char nb[32]; strncpy_s(nb, g_names[es.idx[i]], _TRUNCATE);
+                        DrawString(mid - TextWidth(nb) / 2, (int)by0 - 17, nb, col);
+                    }
+                    {
+                        char db[48]; db[0] = 0;
+                        if (g_opt.espDist) {
+                            const float ex = es.feet[i][0] - es.eye[0], ey = es.feet[i][1] - es.eye[1], ez = es.feet[i][2] - es.eye[2];
+                            sprintf_s(db, "%dm", (int)(sqrtf(ex * ex + ey * ey + ez * ez) * 0.01905f));
+                        }
+                        if (g_opt.espHp) { char hb[16]; sprintf_s(hb, "%s%dhp", db[0] ? " " : "", es.hp[i]); strcat_s(db, hb); }
+                        if (db[0]) DrawString(mid - TextWidth(db) / 2, (int)by1 + 2, db, col);
+                    }
                 }
             }
         }
@@ -824,7 +1009,16 @@ namespace {
                 dev->SetRenderTarget(0, bb);
                 D3DVIEWPORT9 vp = { 0, 0, (DWORD)sw, (DWORD)sh, 0.0f, 1.0f }; dev->SetViewport(&vp);
                 SetBaseStates(dev);
-                FlushSolids(dev);                                                    // ESP
+                FlushSolids(dev);                                                    // ESP boxes
+                if (g_nvct >= 3 && g_atlasTex.t) {                                   // ESP text
+                    dev->SetTexture(0, g_atlasTex.t);
+                    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2); dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+                    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+                    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE); dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+                    dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+                    dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, g_nvct / 3, g_vct, sizeof(VCT));
+                }
+                g_nvct = 0;
                 if (open) DrawTex(dev, g_menuTex.t, (float)mx, (float)my, (float)kMenuW, (float)kMenuH,
                                   (float)kMenuW / kMenuTex, (float)kMenuH / kMenuTex);
                 DrawTex(dev, g_hudTex.t, (float)(sw - kHudUsedW), 0.0f, (float)kHudUsedW, (float)kHudUsedH,
@@ -955,6 +1149,7 @@ namespace {
     DWORD WINAPI Worker(void*) {
         LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpcFreq = f.QuadPart;
         g_inputThread = CreateThread(nullptr, 0, InputThread, nullptr, 0, nullptr);
+        CfgLoad();
 
         bool ok = false;
         for (int i = 0; i < 50 && !ok; ++i) { ok = InitInterfaces(); if (!ok) Sleep(200); }
@@ -974,7 +1169,11 @@ namespace {
             }
             const bool fg = GameForeground();
             const bool tog = fg && (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-            if (tog && !prevToggle) InterlockedExchange(&g_menuOpen, InterlockedCompareExchange(&g_menuOpen, 0, 0) ? 0 : 1);
+            if (tog && !prevToggle) {
+                const bool wasOpen = InterlockedCompareExchange(&g_menuOpen, 0, 0) != 0;
+                InterlockedExchange(&g_menuOpen, wasOpen ? 0 : 1);
+                if (wasOpen) CfgSave();
+            }
             prevToggle = tog;
             const bool end = fg && (GetAsyncKeyState(VK_END) & 0x8000);
             if (end && !prevEnd) { InterlockedExchange(&g_unloading, 1); break; }
@@ -982,6 +1181,7 @@ namespace {
             Sleep(5);
         }
 
+        CfgSave();
         InterlockedExchange(&g_enabled, 0);
         InterlockedExchange(&g_menuOpen, 0);
         InterlockedExchange(&g_ifaceReady, 0);
