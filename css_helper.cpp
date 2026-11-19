@@ -1,3 +1,4 @@
+// [patch:004_srvhit] applied
 // [patch:003_head] applied
 // [patch:002_rage] applied
 // [patch:001_aim_ru] applied
@@ -211,6 +212,9 @@ namespace {
         { "CWeaponMAC10", W_SMG, 0.08f }, { "CWeaponTMP", W_SMG, 0.075f }, { "CWeaponM249", W_SMG, 0.085f },
     };
     char g_wpnName[40] = "?";
+    // rage: shot target handed to the server-side hook
+    DWORD g_rTick = 0; volatile LONG g_rValid = 0; float g_rEye[3] = { 0, 0, 0 }, g_rPt[3] = { 0, 0, 0 };
+    volatile LONG g_fbHooked = 0, g_fbBad = 0, g_fbCalls = 0, g_fbRedirects = 0;
     volatile LONG g_headMode = 0;     // debug: 1 = head found by scan, 2 = fallback guess
     float MaxSpeedFor(WpnClass c) {
         switch (c) { case W_SNIPER: return 135.0f; case W_RIFLE: return 110.0f; case W_SMG: return 130.0f;
@@ -639,6 +643,8 @@ namespace {
                     bp[0] = pts[q][0]; bp[1] = pts[q][1]; bp[2] = pts[q][2]; found = true;
                 }
             }
+            if (found) { g_rEye[0] = eye[0]; g_rEye[1] = eye[1]; g_rEye[2] = eye[2]; g_rPt[0] = bp[0]; g_rPt[1] = bp[1]; g_rPt[2] = bp[2]; g_rTick = GetTickCount(); g_rValid = 1; }
+            else g_rValid = 0;
             float pitch, yaw;
             if (found) {
                 const float dx = bp[0] - eyeR[0], dy = bp[1] - eyeR[1], dz = bp[2] - eyeR[2];
@@ -649,6 +655,7 @@ namespace {
             }
             while (yaw > 180.0f) yaw -= 360.0f; while (yaw < -180.0f) yaw += 360.0f;
             if (pitch > 89.0f) pitch = 89.0f; if (pitch < -89.0f) pitch = -89.0f;
+            if (g_fbHooked && found) { pitch = cmd->viewangles[0]; yaw = cmd->viewangles[1]; }   // server hook does the aiming
             const float dd = (yaw - cmd->viewangles[1]) * kPi / 180.0f;
             const float f = cmd->forwardmove, sd = cmd->sidemove;
             cmd->forwardmove = f * cosf(dd) - sd * sinf(dd);
@@ -658,6 +665,50 @@ namespace {
 
         // ---- no spread: pick the random seed whose bullet spread is ~zero (server uses the seed we send)
         if (g_opt.noSpread && (cmd->buttons & IN_ATTACK) && wc != W_SHOTGUN) cmd->random_seed = BestSeed();
+    }
+
+    void LogMsg(const char* fmt, ...);
+    // ---------------- server side: CCSPlayer::FireBullet (server.dll, in-process listen server) ----------------
+    typedef void (__fastcall* FireBulletFn)(void*, void*, float, float, float, const float*, float, float, int, int, int, float, void*, int, float, float);
+    FireBulletFn g_origFireBullet = nullptr;
+    constexpr DWORD kServerImageSize = 0x642000, kFireBulletRva = 0x2F4470;
+    const unsigned char kFireBulletSig[] = { 0x81, 0xEC, 0xA0, 0x03, 0x00, 0x00, 0xDB, 0x84, 0x24, 0xC4, 0x03, 0x00, 0x00, 0x53, 0x55, 0x56, 0x57 };
+
+    void __fastcall HookFireBullet(void* self, void* edx, float sx, float sy, float sz, const float* ang, float spread, float dist,
+                                   int pen, int btype, int dmg, float rmod, void* attacker, int fx, float x, float y) {
+        InterlockedIncrement(&g_activeHooks);
+        float a2[3];
+        InterlockedIncrement(&g_fbCalls);
+        if (g_opt.rage && g_rValid && InterlockedCompareExchange(&g_botsOnly, 0, 0) && (GetTickCount() - g_rTick) < 250) {
+            const float ex = sx - g_rEye[0], ey = sy - g_rEye[1], ez = sz - g_rEye[2];
+            if (ex * ex + ey * ey + ez * ez < 48.0f * 48.0f) {                      // the shooter is the local player
+                const float dx = g_rPt[0] - sx, dy = g_rPt[1] - sy, dz = g_rPt[2] - sz;
+                a2[0] = -atan2f(dz, sqrtf(dx * dx + dy * dy)) * 180.0f / kPi;
+                a2[1] = atan2f(dy, dx) * 180.0f / kPi;
+                a2[2] = 0.0f;
+                ang = a2; spread = 0.0f; x = 0.0f; y = 0.0f;
+                InterlockedIncrement(&g_fbRedirects);
+            }
+        }
+        g_origFireBullet(self, edx, sx, sy, sz, ang, spread, dist, pen, btype, dmg, rmod, attacker, fx, x, y);
+        InterlockedDecrement(&g_activeHooks);
+    }
+
+    bool InstallServerHook() {
+        if (InterlockedCompareExchange(&g_fbBad, 0, 0)) return false;
+        HMODULE sv = GetModuleHandleA("server.dll");
+        if (!sv) return false;
+        auto dos = (IMAGE_DOS_HEADER*)sv; auto nt = (IMAGE_NT_HEADERS*)((unsigned char*)sv + dos->e_lfanew);
+        unsigned char* fn = (unsigned char*)sv + kFireBulletRva;
+        if (nt->OptionalHeader.SizeOfImage != kServerImageSize || memcmp(fn, kFireBulletSig, sizeof(kFireBulletSig)) != 0) {
+            InterlockedExchange(&g_fbBad, 1); LogMsg("server.dll: different build, server hook skipped"); return false;
+        }
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        if (MH_CreateHook(fn, (void*)&HookFireBullet, (void**)&g_origFireBullet) != MH_OK) { InterlockedExchange(&g_fbBad, 1); return false; }
+        if (MH_EnableHook(fn) != MH_OK) { InterlockedExchange(&g_fbBad, 1); return false; }
+        InterlockedExchange(&g_fbHooked, 1);
+        return true;
     }
 
     // ---------------- hook ----------------
@@ -854,11 +905,12 @@ namespace {
             Checkbox(u, x, y, w, "РЕЙДЖ-режим (бета)", &g_opt.rage);                      y += 34;
             Text(u.dc, x + 6, y, "Каждый выстрел уходит во врага:", kDim);                 y += 20;
             Text(u.dc, x + 6, y, "голова, иначе тело, иначе ноги.", kDim);                 y += 20;
-            Text(u.dc, x + 6, y, "Работает, пока стреляешь. FOV не нужен.", kDim);        y += 30;
+            Text(u.dc, x + 6, y, "Пуля летит строго в цель, без разброса.", kDim);        y += 30;
             Slider(u, x, y, w, "Компенсация отдачи", &g_opt.recoilPct, 0, 300);            y += 56;
             Text(u.dc, x + 6, y, "Пули летят выше цели - увеличь,", kDim);                 y += 20;
             Text(u.dc, x + 6, y, "ниже цели - уменьши. Старт: 200%.", kDim);               y += 28;
-            Text(u.dc, x + 6, y, "Цель и голову берёт из вкладки Аим.", kDim);
+            Text(u.dc, x + 6, y, "Цель и голову берёт из вкладки Аим.", kDim);                 y += 24;
+            Text(u.dc, x + 6, y, InterlockedCompareExchange(&g_fbHooked, 0, 0) ? "Серверный хук: активен" : "Серверный хук: не найден", kDim);
         } else {
             Checkbox(u, x, y, w, "Банихоп (держи пробел)", &g_opt.bhop);                   y += 28;
             Checkbox(u, x, y, w, "Автострейф (в воздухе, за мышью)", &g_opt.autoStrafe);    y += 40;
@@ -1314,7 +1366,7 @@ namespace {
             if (!InstallHook()) InterlockedExchange(&g_status, 2);
             else InterlockedExchange(&g_ifaceReady, 1);
         }
-        bool renderOk = false; DWORD lastTry = 0; int tries = 0;
+        bool renderOk = false; DWORD lastTry = 0; int tries = 0; DWORD lastSv = 0;
 
         bool prevToggle = false, prevEnd = false;
         while (!InterlockedCompareExchange(&g_unloading, 0, 0)) {
@@ -1322,6 +1374,10 @@ namespace {
             if (!renderOk && tries < 60 && now - lastTry >= 1000) {
                 lastTry = now; ++tries;
                 renderOk = InstallRender();
+            }
+            if (!InterlockedCompareExchange(&g_fbHooked, 0, 0) && now - lastSv >= 1000) {
+                lastSv = now;
+                if (InterlockedCompareExchange(&g_ifaceReady, 0, 0) && InstallServerHook()) LogMsg("server FireBullet hooked");
             }
             const bool fg = GameForeground();
             const bool tog = fg && (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
