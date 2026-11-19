@@ -52,15 +52,19 @@ jobs:
             cs16_injector.exe
           if-no-files-found: error
 
-      - name: Commit patched source back to the repo
+      - name: Commit patched source and binaries back to the repo
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item css_helper.dll dist/css_helper.dll -Force
+          Copy-Item cs16_injector.exe dist/cs16_injector.exe -Force
+          Compress-Archive -Path css_helper.dll, cs16_injector.exe -DestinationPath dist/css-helper-win32.zip -Force
           git config user.name "build-bot"
           git config user.email "build-bot@users.noreply.github.com"
-          git add css_helper.cpp
+          git add css_helper.cpp dist
           git diff --cached --quiet
           if ($LASTEXITCODE -ne 0) {
-            git commit -m "Apply source patches [skip ci]"
+            git commit -m "Build output and patched source [skip ci]"
             git push
           }
           exit 0
