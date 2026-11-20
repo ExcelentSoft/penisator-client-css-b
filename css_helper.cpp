@@ -1,3 +1,4 @@
+// [patch:005_dmg] applied
 // [patch:004_srvhit] applied
 // [patch:003_head] applied
 // [patch:002_rage] applied
@@ -352,7 +353,7 @@ namespace {
         }
         if (n < 3) return false;
         const float mo = sx / (float)n;
-        out[0] = fx + px * mo; out[1] = fy + py * mo; out[2] = sz / (float)n + 0.5f;
+        out[0] = fx + px * mo; out[1] = fy + py * mo; out[2] = sz / (float)n + 1.0f;
         return true;
     }
 
@@ -687,6 +688,7 @@ namespace {
                 a2[1] = atan2f(dy, dx) * 180.0f / kPi;
                 a2[2] = 0.0f;
                 ang = a2; spread = 0.0f; x = 0.0f; y = 0.0f;
+                rmod = 1.0f; dmg *= 4;
                 InterlockedIncrement(&g_fbRedirects);
             }
         }
